@@ -1,0 +1,29 @@
+{
+  "_comment": "Example hooks configuration for Claude Code. Copy relevant sections to your .claude/settings.json",
+
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/orchestrator-resume.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/orchestrator-check-incomplete.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

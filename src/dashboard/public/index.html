@@ -1,0 +1,1065 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Orchestrator Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        'claude-orange': '#E67E22',
+                        'claude-dark': '#1a1a2e',
+                        'claude-darker': '#16213e',
+                        'claude-accent': '#0f3460',
+                    }
+                }
+            }
+        }
+        // Initialize dark mode from localStorage before page renders
+        if (localStorage.getItem('theme') === 'light') {
+            document.documentElement.classList.remove('dark');
+        }
+    </script>
+    <style>
+        @keyframes pulse-slow {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        .animate-pulse-slow {
+            animation: pulse-slow 2s ease-in-out infinite;
+        }
+        /* Dark mode scrollbar */
+        .dark .scrollbar-thin::-webkit-scrollbar {
+            width: 6px;
+        }
+        .dark .scrollbar-thin::-webkit-scrollbar-track {
+            background: #1a1a2e;
+        }
+        .dark .scrollbar-thin::-webkit-scrollbar-thumb {
+            background: #4a5568;
+            border-radius: 3px;
+        }
+        /* Light mode scrollbar */
+        .scrollbar-thin::-webkit-scrollbar {
+            width: 6px;
+        }
+        .scrollbar-thin::-webkit-scrollbar-track {
+            background: #e5e7eb;
+        }
+        .scrollbar-thin::-webkit-scrollbar-thumb {
+            background: #9ca3af;
+            border-radius: 3px;
+        }
+        /* Smooth transitions for theme switching */
+        html.transitioning,
+        html.transitioning *,
+        html.transitioning *::before,
+        html.transitioning *::after {
+            transition: background-color 0.3s ease, border-color 0.3s ease, color 0.3s ease !important;
+        }
+        /* Collapsible section animations */
+        .section-content {
+            overflow: hidden;
+            transition: max-height 0.3s ease-out, opacity 0.3s ease-out;
+        }
+        .section-content.collapsed {
+            max-height: 0 !important;
+            opacity: 0;
+        }
+        .section-chevron {
+            transition: transform 0.3s ease;
+        }
+        .section-chevron.collapsed {
+            transform: rotate(-90deg);
+        }
+        /* Terminal output styling */
+        .terminal-output {
+            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.4;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        /* Modal backdrop */
+        .modal-backdrop {
+            backdrop-filter: blur(4px);
+        }
+    </style>
+</head>
+<body class="bg-gray-100 dark:bg-claude-dark text-gray-900 dark:text-gray-100 min-h-screen transition-colors">
+    <div class="container mx-auto px-3 sm:px-4 py-4 sm:py-6 max-w-7xl">
+        <!-- Header Section -->
+        <header class="mb-6 sm:mb-8">
+            <div class="flex flex-col gap-4">
+                <!-- Top row: Logo, Title, and Controls -->
+                <div class="flex items-center justify-between">
+                    <div class="flex items-center gap-3 sm:gap-4">
+                        <div class="w-10 h-10 sm:w-12 sm:h-12 bg-gradient-to-br from-claude-orange to-orange-600 rounded-xl flex items-center justify-center shadow-lg flex-shrink-0">
+                            <svg class="w-6 h-6 sm:w-7 sm:h-7 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"></path>
+                            </svg>
+                        </div>
+                        <div class="min-w-0">
+                            <h1 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white truncate">Claude Orchestrator</h1>
+                            <p class="text-gray-500 dark:text-gray-400 text-xs sm:text-sm truncate" id="project-path">Loading...</p>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-2 sm:gap-3">
+                        <!-- Dark Mode Toggle -->
+                        <button onclick="toggleTheme()" class="p-2.5 hover:bg-gray-200 dark:hover:bg-claude-accent rounded-lg transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center" title="Toggle Dark Mode" aria-label="Toggle dark mode">
+                            <!-- Sun icon (shown in dark mode) -->
+                            <svg class="w-5 h-5 hidden dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path>
+                            </svg>
+                            <!-- Moon icon (shown in light mode) -->
+                            <svg class="w-5 h-5 block dark:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path>
+                            </svg>
+                        </button>
+                        <!-- Refresh Button -->
+                        <button onclick="refreshData()" class="p-2.5 hover:bg-gray-200 dark:hover:bg-claude-accent rounded-lg transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center" title="Refresh" aria-label="Refresh data">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <!-- Second row: Status badge and elapsed time -->
+                <div class="flex items-center justify-between gap-3">
+                    <div id="status-badge" class="px-3 sm:px-4 py-1.5 sm:py-2 rounded-full text-xs sm:text-sm font-medium flex items-center gap-2 bg-gray-300 dark:bg-gray-700">
+                        <span class="w-2 h-2 rounded-full bg-gray-400"></span>
+                        <span>Loading...</span>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-xs text-gray-500">Elapsed Time</div>
+                        <div id="elapsed-time" class="text-base sm:text-lg font-mono text-gray-700 dark:text-gray-300">--:--:--</div>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Progress Bar Section -->
+        <section class="mb-6 sm:mb-8">
+            <div class="bg-white dark:bg-claude-darker rounded-xl p-4 sm:p-6 shadow-lg border border-gray-200 dark:border-gray-800">
+                <div class="flex items-center justify-between mb-3">
+                    <h2 class="text-base sm:text-lg font-semibold text-gray-900 dark:text-white">Overall Progress</h2>
+                    <span id="progress-text" class="text-xs sm:text-sm text-gray-500 dark:text-gray-400">0 / 0 features</span>
+                </div>
+                <div class="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-3 sm:h-4 overflow-hidden">
+                    <div id="progress-bar" class="h-full rounded-full bg-gradient-to-r from-green-500 to-emerald-400 transition-all duration-500" style="width: 0%"></div>
+                </div>
+                <div class="flex flex-wrap justify-between gap-2 mt-2 text-xs text-gray-500 dark:text-gray-500">
+                    <span id="completed-count">0 completed</span>
+                    <span id="in-progress-count">0 in progress</span>
+                    <span id="pending-count">0 pending</span>
+                    <span id="failed-count">0 failed</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Main Grid Layout -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-6">
+            <!-- Features Column (2/3 width) -->
+            <div class="lg:col-span-2 space-y-4 sm:space-y-6">
+                <!-- Features Section -->
+                <section class="bg-white dark:bg-transparent rounded-xl sm:bg-transparent sm:dark:bg-transparent">
+                    <button onclick="toggleSection('features')" class="w-full flex items-center justify-between p-3 sm:p-0 sm:mb-4 min-h-[44px] sm:min-h-0 sm:cursor-default">
+                        <h2 class="text-lg sm:text-xl font-semibold flex items-center gap-2 text-gray-900 dark:text-white">
+                            <svg class="w-5 h-5 text-claude-orange" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"></path>
+                            </svg>
+                            Features
+                        </h2>
+                        <div class="flex items-center gap-2">
+                            <span id="feature-count" class="text-xs sm:text-sm text-gray-500 dark:text-gray-400">0 features</span>
+                            <svg class="w-5 h-5 text-gray-400 sm:hidden section-chevron" id="features-chevron" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+                            </svg>
+                        </div>
+                    </button>
+                    <div id="features-content" class="section-content px-3 pb-3 sm:px-0 sm:pb-0" style="max-height: 2000px;">
+                        <div id="features-container" class="space-y-3">
+                            <!-- Feature cards will be inserted here -->
+                            <div class="bg-gray-50 dark:bg-claude-darker rounded-lg p-4 sm:p-6 text-center text-gray-500 border border-gray-200 dark:border-gray-800">
+                                <svg class="w-10 h-10 sm:w-12 sm:h-12 mx-auto mb-3 text-gray-400 dark:text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"></path>
+                                </svg>
+                                <p class="text-gray-600 dark:text-gray-400">No features loaded</p>
+                                <p class="text-sm mt-1 text-gray-500">Start an orchestration session to see features</p>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Active Workers Section -->
+                <section class="bg-white dark:bg-transparent rounded-xl sm:bg-transparent sm:dark:bg-transparent">
+                    <button onclick="toggleSection('workers')" class="w-full flex items-center justify-between p-3 sm:p-0 sm:mb-4 min-h-[44px] sm:min-h-0 sm:cursor-default">
+                        <h2 class="text-lg sm:text-xl font-semibold flex items-center gap-2 text-gray-900 dark:text-white">
+                            <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                            </svg>
+                            Active Workers
+                        </h2>
+                        <div class="flex items-center gap-2">
+                            <span id="worker-count" class="text-xs sm:text-sm text-gray-500 dark:text-gray-400">0 workers</span>
+                            <svg class="w-5 h-5 text-gray-400 sm:hidden section-chevron" id="workers-chevron" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+                            </svg>
+                        </div>
+                    </button>
+                    <div id="workers-content" class="section-content px-3 pb-3 sm:px-0 sm:pb-0" style="max-height: 1000px;">
+                        <div id="workers-container" class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            <div class="bg-gray-50 dark:bg-claude-darker rounded-lg p-4 text-center text-gray-500 border border-gray-200 dark:border-gray-800 col-span-full">
+                                <p class="text-gray-600 dark:text-gray-400">No active workers</p>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Right Column (1/3 width) -->
+            <div class="space-y-4 sm:space-y-6">
+                <!-- Stats Panel -->
+                <section class="bg-white dark:bg-claude-darker rounded-xl p-4 sm:p-6 shadow-lg border border-gray-200 dark:border-gray-800">
+                    <h2 class="text-base sm:text-lg font-semibold mb-4 flex items-center gap-2 text-gray-900 dark:text-white">
+                        <svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
+                        </svg>
+                        Statistics
+                    </h2>
+                    <div class="space-y-4">
+                        <div class="flex justify-between items-center">
+                            <span class="text-gray-600 dark:text-gray-400">Success Rate</span>
+                            <span id="success-rate" class="text-lg sm:text-xl font-bold text-green-500 dark:text-green-400">--%</span>
+                        </div>
+                        <div class="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+                            <div id="success-rate-bar" class="h-full rounded-full bg-green-500 transition-all duration-500" style="width: 0%"></div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-3 sm:gap-4 pt-4 border-t border-gray-200 dark:border-gray-700">
+                            <div>
+                                <div class="text-xs text-gray-500 uppercase tracking-wide">Avg. Completion</div>
+                                <div id="avg-completion" class="text-base sm:text-lg font-mono text-gray-700 dark:text-gray-300">--:--</div>
+                            </div>
+                            <div>
+                                <div class="text-xs text-gray-500 uppercase tracking-wide">Total Attempts</div>
+                                <div id="total-attempts" class="text-base sm:text-lg font-mono text-gray-700 dark:text-gray-300">0</div>
+                            </div>
+                            <div>
+                                <div class="text-xs text-gray-500 uppercase tracking-wide">Retries</div>
+                                <div id="total-retries" class="text-base sm:text-lg font-mono text-gray-700 dark:text-gray-300">0</div>
+                            </div>
+                            <div>
+                                <div class="text-xs text-gray-500 uppercase tracking-wide">Max Concurrent</div>
+                                <div id="max-concurrent" class="text-base sm:text-lg font-mono text-gray-700 dark:text-gray-300">0</div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Progress Log -->
+                <section class="bg-white dark:bg-claude-darker rounded-xl overflow-hidden shadow-lg border border-gray-200 dark:border-gray-800">
+                    <button onclick="toggleSection('log')" class="w-full flex items-center justify-between p-4 sm:p-6 sm:pb-4 min-h-[44px]">
+                        <h2 class="text-base sm:text-lg font-semibold flex items-center gap-2 text-gray-900 dark:text-white">
+                            <svg class="w-5 h-5 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            </svg>
+                            Activity Log
+                        </h2>
+                        <div class="flex items-center gap-2">
+                            <span id="log-count" class="text-xs text-gray-500">0 entries</span>
+                            <svg class="w-5 h-5 text-gray-400 sm:hidden section-chevron" id="log-chevron" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+                            </svg>
+                        </div>
+                    </button>
+                    <div id="log-content" class="section-content px-4 pb-4 sm:px-6 sm:pb-6" style="max-height: 400px;">
+                        <div id="log-container" class="space-y-2 max-h-72 sm:max-h-96 overflow-y-auto scrollbar-thin">
+                            <div class="text-center text-gray-500 py-4">
+                                <p class="text-sm">No activity yet</p>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <footer class="mt-6 sm:mt-8 pt-4 sm:pt-6 border-t border-gray-200 dark:border-gray-800 text-center text-gray-500 text-xs sm:text-sm">
+            <p>Claude Orchestrator Dashboard &bull; Auto-refresh: <span id="refresh-status" class="text-green-500 dark:text-green-400">Active</span></p>
+            <p class="text-xs mt-1">Last updated: <span id="last-updated">Never</span></p>
+        </footer>
+    </div>
+
+    <!-- Worker Output Modal -->
+    <div id="output-modal" class="fixed inset-0 z-50 hidden">
+        <!-- Backdrop -->
+        <div class="absolute inset-0 bg-black/50 dark:bg-black/70 modal-backdrop" onclick="closeOutputModal()"></div>
+
+        <!-- Modal Content -->
+        <div class="absolute inset-2 sm:inset-4 md:inset-8 lg:inset-12 flex flex-col">
+            <div class="bg-white dark:bg-claude-darker rounded-xl border border-gray-200 dark:border-gray-700 shadow-2xl flex flex-col h-full overflow-hidden">
+                <!-- Modal Header -->
+                <div class="flex items-center justify-between px-4 sm:px-6 py-3 sm:py-4 border-b border-gray-200 dark:border-gray-700 flex-shrink-0">
+                    <div class="flex items-center gap-3 min-w-0">
+                        <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center flex-shrink-0">
+                            <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
+                            </svg>
+                        </div>
+                        <div class="min-w-0">
+                            <h3 class="text-base sm:text-lg font-semibold text-gray-900 dark:text-white truncate">Worker Terminal Output</h3>
+                            <p id="modal-feature-id" class="text-xs sm:text-sm text-gray-500 dark:text-gray-400 font-mono truncate">--</p>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-2 sm:gap-3 flex-shrink-0">
+                        <div id="modal-status" class="hidden sm:flex items-center gap-2 px-3 py-1 bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300 rounded-full text-sm">
+                            <span class="w-2 h-2 rounded-full bg-blue-500 dark:bg-blue-400 animate-pulse"></span>
+                            <span>Streaming</span>
+                        </div>
+                        <button onclick="closeOutputModal()" class="p-2.5 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center" title="Close" aria-label="Close modal">
+                            <svg class="w-5 h-5 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Terminal Output Area -->
+                <div class="flex-grow overflow-hidden p-3 sm:p-4">
+                    <div id="terminal-output" class="h-full bg-gray-100 dark:bg-gray-900 rounded-lg p-3 sm:p-4 overflow-y-auto scrollbar-thin">
+                        <pre class="terminal-output text-green-600 dark:text-green-400">Connecting to worker...</pre>
+                    </div>
+                </div>
+
+                <!-- Modal Footer -->
+                <div class="flex items-center justify-between px-4 sm:px-6 py-3 border-t border-gray-200 dark:border-gray-700 flex-shrink-0 bg-gray-50 dark:bg-claude-dark/50">
+                    <div class="text-xs text-gray-500 hidden sm:block">
+                        <span>Auto-updating every 2s</span>
+                        <span class="mx-2">|</span>
+                        <span>Last update: <span id="modal-last-update">--</span></span>
+                    </div>
+                    <button onclick="closeOutputModal()" class="px-4 py-2.5 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 rounded-lg text-sm transition-colors min-h-[44px] text-gray-700 dark:text-gray-200 sm:ml-auto">
+                        Close
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const API_BASE = '/api';
+        const REFRESH_INTERVAL = 3000; // 3 seconds (fallback polling)
+        let refreshTimer = null;
+        let sessionStartTime = null;
+        let eventSource = null;
+        let features = new Map(); // Track features by ID for SSE updates
+        let logs = []; // Track logs for SSE updates
+        let useSSE = true; // Whether to use SSE (fallback to polling if unavailable)
+
+        // Status configurations
+        const STATUS_CONFIG = {
+            pending: { color: 'gray', bgClass: 'bg-gray-600', textClass: 'text-gray-400', icon: '⏳' },
+            in_progress: { color: 'blue', bgClass: 'bg-blue-600', textClass: 'text-blue-400', icon: '🔄', pulse: true },
+            completed: { color: 'green', bgClass: 'bg-green-600', textClass: 'text-green-400', icon: '✓' },
+            failed: { color: 'red', bgClass: 'bg-red-600', textClass: 'text-red-400', icon: '✗' },
+            paused: { color: 'yellow', bgClass: 'bg-yellow-600', textClass: 'text-yellow-400', icon: '⏸' },
+            not_started: { color: 'gray', bgClass: 'bg-gray-700', textClass: 'text-gray-500', icon: '○' }
+        };
+
+        // Format duration from milliseconds
+        function formatDuration(ms) {
+            if (!ms || ms < 0) return '--:--';
+            const seconds = Math.floor(ms / 1000);
+            const minutes = Math.floor(seconds / 60);
+            const hours = Math.floor(minutes / 60);
+
+            if (hours > 0) {
+                return `${hours}:${String(minutes % 60).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+            }
+            return `${minutes}:${String(seconds % 60).padStart(2, '0')}`;
+        }
+
+        // Format timestamp for log entries
+        function formatTimestamp(isoString) {
+            const date = new Date(isoString);
+            return date.toLocaleTimeString('en-US', {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false
+            });
+        }
+
+        // Update elapsed time display
+        function updateElapsedTime() {
+            if (!sessionStartTime) {
+                document.getElementById('elapsed-time').textContent = '--:--:--';
+                return;
+            }
+            const elapsed = Date.now() - new Date(sessionStartTime).getTime();
+            document.getElementById('elapsed-time').textContent = formatDuration(elapsed);
+        }
+
+        // Update status badge
+        function updateStatusBadge(status) {
+            const badge = document.getElementById('status-badge');
+            const config = STATUS_CONFIG[status] || STATUS_CONFIG.not_started;
+
+            badge.className = `px-4 py-2 rounded-full text-sm font-medium flex items-center gap-2 ${config.bgClass}`;
+            if (config.pulse) {
+                badge.classList.add('animate-pulse-slow');
+            }
+
+            badge.innerHTML = `
+                <span class="w-2 h-2 rounded-full bg-white"></span>
+                <span>${status.replace('_', ' ').toUpperCase()}</span>
+            `;
+        }
+
+        // Update progress bar
+        function updateProgress(features) {
+            if (!features || features.length === 0) {
+                document.getElementById('progress-bar').style.width = '0%';
+                document.getElementById('progress-text').textContent = '0 / 0 features';
+                return;
+            }
+
+            const total = features.length;
+            const completed = features.filter(f => f.status === 'completed').length;
+            const inProgress = features.filter(f => f.status === 'in_progress').length;
+            const pending = features.filter(f => f.status === 'pending').length;
+            const failed = features.filter(f => f.status === 'failed').length;
+
+            const percentage = Math.round((completed / total) * 100);
+
+            document.getElementById('progress-bar').style.width = `${percentage}%`;
+            document.getElementById('progress-text').textContent = `${completed} / ${total} features`;
+            document.getElementById('completed-count').textContent = `${completed} completed`;
+            document.getElementById('in-progress-count').textContent = `${inProgress} in progress`;
+            document.getElementById('pending-count').textContent = `${pending} pending`;
+            document.getElementById('failed-count').textContent = `${failed} failed`;
+            document.getElementById('feature-count').textContent = `${total} features`;
+        }
+
+        // Create feature card HTML
+        function createFeatureCard(feature) {
+            const config = STATUS_CONFIG[feature.status] || STATUS_CONFIG.pending;
+            const attempts = feature.attempts || 0;
+            const hasWorker = feature.workerSession ? true : false;
+
+            return `
+                <div class="bg-gray-50 dark:bg-claude-darker rounded-lg p-3 sm:p-4 border border-gray-200 dark:border-gray-800 hover:border-gray-300 dark:hover:border-gray-700 transition-colors ${config.pulse ? 'animate-pulse-slow' : ''}">
+                    <div class="flex items-start gap-3">
+                        <div class="flex-shrink-0 w-8 h-8 rounded-lg ${config.bgClass} flex items-center justify-center text-white text-sm font-bold">
+                            ${config.icon}
+                        </div>
+                        <div class="flex-grow min-w-0">
+                            <div class="flex flex-wrap items-center gap-2">
+                                <span class="font-mono text-xs ${config.textClass}">${feature.id}</span>
+                                ${hasWorker ? '<span class="px-2 py-0.5 bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300 rounded text-xs">Worker Active</span>' : ''}
+                                ${attempts > 1 ? `<span class="px-2 py-0.5 bg-yellow-100 dark:bg-yellow-900 text-yellow-700 dark:text-yellow-300 rounded text-xs">Attempt ${attempts}</span>` : ''}
+                            </div>
+                            <p class="text-gray-700 dark:text-gray-300 mt-1 text-sm">${feature.description}</p>
+                            ${feature.completedAt ? `<p class="text-xs text-gray-500 mt-2">Completed: ${formatTimestamp(feature.completedAt)}</p>` : ''}
+                            ${feature.notes ? `<p class="text-xs text-gray-500 dark:text-gray-400 mt-1 italic">${feature.notes}</p>` : ''}
+                            ${feature.dependsOn && feature.dependsOn.length > 0 ? `
+                                <div class="mt-2 flex items-center gap-1 text-xs text-gray-500">
+                                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path>
+                                    </svg>
+                                    Depends on: ${feature.dependsOn.join(', ')}
+                                </div>
+                            ` : ''}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Update features display
+        function updateFeatures(features) {
+            const container = document.getElementById('features-container');
+
+            if (!features || features.length === 0) {
+                container.innerHTML = `
+                    <div class="bg-gray-50 dark:bg-claude-darker rounded-lg p-4 sm:p-6 text-center text-gray-500 border border-gray-200 dark:border-gray-800">
+                        <svg class="w-10 h-10 sm:w-12 sm:h-12 mx-auto mb-3 text-gray-400 dark:text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"></path>
+                        </svg>
+                        <p class="text-gray-600 dark:text-gray-400">No features loaded</p>
+                        <p class="text-sm mt-1 text-gray-500">Start an orchestration session to see features</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = features.map(createFeatureCard).join('');
+        }
+
+        // Create worker card HTML
+        function createWorkerCard(worker) {
+            return `
+                <div class="bg-blue-50 dark:bg-claude-accent rounded-lg p-3 sm:p-4 border border-blue-200 dark:border-blue-800">
+                    <div class="flex items-center justify-between mb-2 gap-2">
+                        <div class="flex items-center gap-2 min-w-0">
+                            <div class="w-2 h-2 rounded-full bg-blue-500 dark:bg-blue-400 animate-pulse flex-shrink-0"></div>
+                            <span class="font-mono text-sm text-blue-700 dark:text-blue-300 truncate">${worker.featureId}</span>
+                        </div>
+                        <button
+                            onclick="openOutputModal('${worker.featureId}')"
+                            class="px-2.5 py-1.5 bg-blue-600 dark:bg-blue-700 hover:bg-blue-700 dark:hover:bg-blue-600 rounded text-xs text-white flex items-center gap-1 transition-colors min-h-[32px] flex-shrink-0"
+                            title="View terminal output"
+                        >
+                            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
+                            </svg>
+                            <span class="hidden sm:inline">View Output</span>
+                        </button>
+                    </div>
+                    <p class="text-xs text-gray-600 dark:text-gray-400">Session: ${worker.session}</p>
+                    <p class="text-xs text-gray-500 mt-1">Started: ${formatTimestamp(worker.startedAt)}</p>
+                </div>
+            `;
+        }
+
+        // Update workers display
+        function updateWorkers(features) {
+            const container = document.getElementById('workers-container');
+            const activeWorkers = features ? features.filter(f => f.workerSession) : [];
+
+            document.getElementById('worker-count').textContent = `${activeWorkers.length} workers`;
+
+            if (activeWorkers.length === 0) {
+                container.innerHTML = `
+                    <div class="bg-gray-50 dark:bg-claude-darker rounded-lg p-4 text-center text-gray-500 border border-gray-200 dark:border-gray-800 col-span-full">
+                        <p class="text-gray-600 dark:text-gray-400">No active workers</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = activeWorkers.map(f => createWorkerCard({
+                featureId: f.id,
+                session: f.workerSession,
+                startedAt: f.startedAt || new Date().toISOString()
+            })).join('');
+        }
+
+        // Update statistics display
+        function updateStats(stats) {
+            if (!stats) {
+                document.getElementById('success-rate').textContent = '--%';
+                document.getElementById('success-rate-bar').style.width = '0%';
+                document.getElementById('avg-completion').textContent = '--:--';
+                document.getElementById('total-attempts').textContent = '0';
+                document.getElementById('total-retries').textContent = '0';
+                document.getElementById('max-concurrent').textContent = '0';
+                return;
+            }
+
+            const successRate = stats.successRate !== undefined ? Math.round(stats.successRate) : 0;
+            document.getElementById('success-rate').textContent = `${successRate}%`;
+            document.getElementById('success-rate-bar').style.width = `${successRate}%`;
+
+            document.getElementById('avg-completion').textContent = formatDuration(stats.avgCompletionTime);
+            document.getElementById('total-attempts').textContent = stats.totalAttempts || 0;
+            document.getElementById('total-retries').textContent = stats.totalRetries || 0;
+            document.getElementById('max-concurrent').textContent = stats.maxConcurrentWorkers || 0;
+        }
+
+        // Create log entry HTML
+        function createLogEntry(entry) {
+            const typeColors = {
+                feature_started: 'text-blue-600 dark:text-blue-400',
+                feature_completed: 'text-green-600 dark:text-green-400',
+                feature_failed: 'text-red-600 dark:text-red-400',
+                worker_started: 'text-cyan-600 dark:text-cyan-400',
+                worker_stopped: 'text-gray-500 dark:text-gray-400',
+                session_started: 'text-purple-600 dark:text-purple-400',
+                session_paused: 'text-yellow-600 dark:text-yellow-400',
+                session_resumed: 'text-purple-600 dark:text-purple-400',
+                verification: 'text-orange-600 dark:text-orange-400',
+                commit: 'text-pink-600 dark:text-pink-400'
+            };
+
+            const colorClass = typeColors[entry.type] || 'text-gray-500 dark:text-gray-400';
+
+            return `
+                <div class="flex gap-2 text-xs py-1.5 border-b border-gray-200 dark:border-gray-800 last:border-0">
+                    <span class="text-gray-500 font-mono flex-shrink-0">${formatTimestamp(entry.timestamp)}</span>
+                    <span class="${colorClass} flex-shrink-0">[${entry.type}]</span>
+                    <span class="text-gray-700 dark:text-gray-300 truncate">${entry.message}</span>
+                </div>
+            `;
+        }
+
+        // Update log display
+        function updateLog(logs) {
+            const container = document.getElementById('log-container');
+
+            if (!logs || logs.length === 0) {
+                container.innerHTML = `
+                    <div class="text-center text-gray-500 py-4">
+                        <p class="text-sm text-gray-600 dark:text-gray-400">No activity yet</p>
+                    </div>
+                `;
+                document.getElementById('log-count').textContent = '0 entries';
+                return;
+            }
+
+            // Show most recent entries first (reverse order)
+            const recentLogs = logs.slice(-50).reverse();
+            container.innerHTML = recentLogs.map(createLogEntry).join('');
+            document.getElementById('log-count').textContent = `${logs.length} entries`;
+        }
+
+        // Fetch all data from API
+        async function fetchData() {
+            try {
+                const [statusRes, statsRes, logsRes] = await Promise.all([
+                    fetch(`${API_BASE}/status`).catch(() => null),
+                    fetch(`${API_BASE}/stats`).catch(() => null),
+                    fetch(`${API_BASE}/logs`).catch(() => null)
+                ]);
+
+                // Handle status response
+                if (statusRes && statusRes.ok) {
+                    const status = await statusRes.json();
+
+                    document.getElementById('project-path').textContent = status.projectDir || 'No project loaded';
+                    updateStatusBadge(status.status || 'not_started');
+                    sessionStartTime = status.startTime;
+
+                    // Update features map for SSE sync
+                    if (status.features) {
+                        features.clear();
+                        for (const f of status.features) {
+                            features.set(f.id, f);
+                        }
+                    }
+
+                    updateProgress(status.features);
+                    updateFeatures(status.features);
+                    updateWorkers(status.features);
+                } else {
+                    updateStatusBadge('not_started');
+                    document.getElementById('project-path').textContent = 'Unable to connect to API';
+                }
+
+                // Handle stats response
+                if (statsRes && statsRes.ok) {
+                    const stats = await statsRes.json();
+                    updateStats(stats);
+                }
+
+                // Handle logs response
+                if (logsRes && logsRes.ok) {
+                    const logsData = await logsRes.json();
+                    const logEntries = logsData.logs || logsData.entries || logsData;
+
+                    // Update logs array for SSE sync
+                    logs = Array.isArray(logEntries) ? logEntries.map(entry => ({
+                        timestamp: entry.timestamp,
+                        message: entry.message,
+                        type: extractLogType(entry.message || ''),
+                        raw: entry.raw
+                    })) : [];
+
+                    updateLog(logs);
+                }
+
+                document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
+                if (!eventSource || eventSource.readyState !== EventSource.OPEN) {
+                    document.getElementById('refresh-status').textContent = 'Polling';
+                    document.getElementById('refresh-status').className = 'text-blue-400';
+                }
+
+            } catch (error) {
+                console.error('Error fetching data:', error);
+                document.getElementById('refresh-status').textContent = 'Error';
+                document.getElementById('refresh-status').className = 'text-red-400';
+            }
+        }
+
+        // Refresh data manually
+        function refreshData() {
+            fetchData();
+        }
+
+        // Start auto-refresh (fallback for when SSE is unavailable)
+        function startAutoRefresh() {
+            if (refreshTimer) clearInterval(refreshTimer);
+            refreshTimer = setInterval(fetchData, REFRESH_INTERVAL);
+        }
+
+        // Stop auto-refresh (when SSE is active)
+        function stopAutoRefresh() {
+            if (refreshTimer) {
+                clearInterval(refreshTimer);
+                refreshTimer = null;
+            }
+        }
+
+        // Connect to Server-Sent Events
+        function connectSSE() {
+            if (eventSource) {
+                eventSource.close();
+            }
+
+            eventSource = new EventSource(`${API_BASE}/events`);
+
+            eventSource.onopen = () => {
+                console.log('SSE connected');
+                document.getElementById('refresh-status').textContent = 'Live (SSE)';
+                document.getElementById('refresh-status').className = 'text-green-400';
+                stopAutoRefresh(); // Stop polling when SSE is connected
+            };
+
+            eventSource.onerror = (error) => {
+                console.error('SSE error:', error);
+                document.getElementById('refresh-status').textContent = 'Reconnecting...';
+                document.getElementById('refresh-status').className = 'text-yellow-400';
+
+                // If SSE fails, fall back to polling
+                if (eventSource.readyState === EventSource.CLOSED) {
+                    useSSE = false;
+                    startAutoRefresh();
+                    // Try to reconnect SSE after a delay
+                    setTimeout(() => {
+                        useSSE = true;
+                        connectSSE();
+                    }, 5000);
+                }
+            };
+
+            // Handle connected event
+            eventSource.addEventListener('connected', (e) => {
+                const data = JSON.parse(e.data);
+                console.log('SSE connected with client ID:', data.clientId);
+            });
+
+            // Handle status updates
+            eventSource.addEventListener('status', (e) => {
+                const data = JSON.parse(e.data);
+                console.log('SSE status update:', data);
+
+                document.getElementById('project-path').textContent = data.projectDir || 'No project loaded';
+                updateStatusBadge(data.status || 'not_started');
+                sessionStartTime = data.startTime;
+                document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
+            });
+
+            // Handle feature updates
+            eventSource.addEventListener('feature', (e) => {
+                const data = JSON.parse(e.data);
+                console.log('SSE feature update:', data.id, data.status);
+
+                // Update feature in our map
+                features.set(data.id, data);
+
+                // Re-render features list
+                const featureArray = Array.from(features.values());
+                updateProgress(featureArray);
+                updateFeatures(featureArray);
+                updateWorkers(featureArray);
+                document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
+            });
+
+            // Handle log updates
+            eventSource.addEventListener('log', (e) => {
+                const data = JSON.parse(e.data);
+                console.log('SSE log update:', data.message);
+
+                // Add to logs array
+                logs.push({
+                    timestamp: data.timestamp,
+                    message: data.message,
+                    type: extractLogType(data.message),
+                    raw: data.raw
+                });
+
+                // Re-render logs
+                updateLog(logs);
+                document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
+            });
+
+            // Handle worker updates
+            eventSource.addEventListener('worker', (e) => {
+                const data = JSON.parse(e.data);
+                console.log('SSE worker update:', data);
+
+                // Refresh workers display using current features
+                const featureArray = Array.from(features.values());
+                updateWorkers(featureArray);
+            });
+
+            // Handle heartbeat
+            eventSource.addEventListener('heartbeat', (e) => {
+                console.log('SSE heartbeat received');
+            });
+        }
+
+        // Extract log type from message for styling
+        function extractLogType(message) {
+            if (message.includes('started')) return 'feature_started';
+            if (message.includes('completed')) return 'feature_completed';
+            if (message.includes('failed')) return 'feature_failed';
+            if (message.includes('worker')) return 'worker_started';
+            if (message.includes('session')) return 'session_started';
+            if (message.includes('paused')) return 'session_paused';
+            if (message.includes('resumed')) return 'session_resumed';
+            if (message.includes('verification')) return 'verification';
+            if (message.includes('commit')) return 'commit';
+            return 'default';
+        }
+
+        // Disconnect SSE
+        function disconnectSSE() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+        }
+
+        // ========================================
+        // Worker Output Modal Functions
+        // ========================================
+        let outputEventSource = null;
+        let currentOutputFeatureId = null;
+
+        // Open the output modal and start streaming
+        function openOutputModal(featureId) {
+            currentOutputFeatureId = featureId;
+
+            // Show modal
+            const modal = document.getElementById('output-modal');
+            modal.classList.remove('hidden');
+
+            // Update modal header
+            document.getElementById('modal-feature-id').textContent = featureId;
+
+            // Reset terminal output
+            const terminalOutput = document.getElementById('terminal-output');
+            terminalOutput.innerHTML = '<pre class="terminal-output text-green-400">Connecting to worker...</pre>';
+
+            // Reset status
+            updateModalStatus('streaming');
+
+            // Start SSE connection
+            connectOutputSSE(featureId);
+
+            // Prevent body scroll
+            document.body.style.overflow = 'hidden';
+        }
+
+        // Close the output modal
+        function closeOutputModal() {
+            // Hide modal
+            const modal = document.getElementById('output-modal');
+            modal.classList.add('hidden');
+
+            // Close SSE connection
+            disconnectOutputSSE();
+
+            // Reset state
+            currentOutputFeatureId = null;
+
+            // Restore body scroll
+            document.body.style.overflow = '';
+        }
+
+        // Update modal status indicator
+        function updateModalStatus(status) {
+            const statusEl = document.getElementById('modal-status');
+            if (status === 'streaming') {
+                statusEl.className = 'flex items-center gap-2 px-3 py-1 bg-blue-900 text-blue-300 rounded-full text-sm';
+                statusEl.innerHTML = '<span class="w-2 h-2 rounded-full bg-blue-400 animate-pulse"></span><span>Streaming</span>';
+            } else if (status === 'ended') {
+                statusEl.className = 'flex items-center gap-2 px-3 py-1 bg-gray-700 text-gray-300 rounded-full text-sm';
+                statusEl.innerHTML = '<span class="w-2 h-2 rounded-full bg-gray-400"></span><span>Ended</span>';
+            } else if (status === 'error') {
+                statusEl.className = 'flex items-center gap-2 px-3 py-1 bg-red-900 text-red-300 rounded-full text-sm';
+                statusEl.innerHTML = '<span class="w-2 h-2 rounded-full bg-red-400"></span><span>Error</span>';
+            }
+        }
+
+        // Connect to worker output SSE
+        function connectOutputSSE(featureId) {
+            if (outputEventSource) {
+                outputEventSource.close();
+            }
+
+            outputEventSource = new EventSource(`${API_BASE}/workers/${featureId}/output`);
+
+            outputEventSource.addEventListener('output', (e) => {
+                const data = JSON.parse(e.data);
+                const terminalOutput = document.getElementById('terminal-output');
+
+                // Escape HTML and display output
+                const escapedOutput = escapeHtml(data.output || '');
+                terminalOutput.innerHTML = `<pre class="terminal-output text-green-400">${escapedOutput}</pre>`;
+
+                // Auto-scroll to bottom
+                terminalOutput.scrollTop = terminalOutput.scrollHeight;
+
+                // Update last update time
+                document.getElementById('modal-last-update').textContent = formatTimestamp(data.timestamp);
+            });
+
+            outputEventSource.addEventListener('ended', (e) => {
+                const data = JSON.parse(e.data);
+                const terminalOutput = document.getElementById('terminal-output');
+
+                // Add ended message
+                const currentContent = terminalOutput.querySelector('pre')?.textContent || '';
+                terminalOutput.innerHTML = `<pre class="terminal-output text-green-400">${escapeHtml(currentContent)}</pre>
+                    <div class="mt-4 pt-4 border-t border-gray-700 text-yellow-400">
+                        Worker session ended: ${escapeHtml(data.message || 'Session closed')}
+                    </div>`;
+
+                updateModalStatus('ended');
+
+                // Clean up SSE connection
+                disconnectOutputSSE();
+            });
+
+            outputEventSource.addEventListener('error', (e) => {
+                console.error('Worker output SSE error:', e);
+                updateModalStatus('error');
+
+                const terminalOutput = document.getElementById('terminal-output');
+                terminalOutput.innerHTML = `<pre class="terminal-output text-red-400">Error connecting to worker output stream.
+The worker may not be running or the connection was lost.</pre>`;
+            });
+
+            outputEventSource.onerror = () => {
+                // Generic error handler
+                if (outputEventSource.readyState === EventSource.CLOSED) {
+                    updateModalStatus('ended');
+                }
+            };
+        }
+
+        // Disconnect worker output SSE
+        function disconnectOutputSSE() {
+            if (outputEventSource) {
+                outputEventSource.close();
+                outputEventSource = null;
+            }
+        }
+
+        // Escape HTML to prevent XSS
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // ========================================
+        // Theme Toggle Functions
+        // ========================================
+        function toggleTheme() {
+            // Add transitioning class for smooth color transitions
+            document.documentElement.classList.add('transitioning');
+
+            const isDark = document.documentElement.classList.contains('dark');
+            if (isDark) {
+                document.documentElement.classList.remove('dark');
+                localStorage.setItem('theme', 'light');
+            } else {
+                document.documentElement.classList.add('dark');
+                localStorage.setItem('theme', 'dark');
+            }
+
+            // Remove transitioning class after animation completes
+            setTimeout(() => {
+                document.documentElement.classList.remove('transitioning');
+            }, 300);
+        }
+
+        // ========================================
+        // Collapsible Section Functions (Mobile)
+        // ========================================
+        const collapsedSections = new Set(JSON.parse(localStorage.getItem('collapsedSections') || '[]'));
+
+        function toggleSection(sectionId) {
+            // Only toggle on mobile (sm breakpoint is 640px)
+            if (window.innerWidth >= 640) return;
+
+            const content = document.getElementById(`${sectionId}-content`);
+            const chevron = document.getElementById(`${sectionId}-chevron`);
+
+            if (!content) return;
+
+            if (content.classList.contains('collapsed')) {
+                // Expand
+                content.classList.remove('collapsed');
+                if (chevron) chevron.classList.remove('collapsed');
+                collapsedSections.delete(sectionId);
+            } else {
+                // Collapse
+                content.classList.add('collapsed');
+                if (chevron) chevron.classList.add('collapsed');
+                collapsedSections.add(sectionId);
+            }
+
+            // Persist collapsed state
+            localStorage.setItem('collapsedSections', JSON.stringify([...collapsedSections]));
+        }
+
+        function restoreCollapsedSections() {
+            // Only restore on mobile
+            if (window.innerWidth >= 640) return;
+
+            collapsedSections.forEach(sectionId => {
+                const content = document.getElementById(`${sectionId}-content`);
+                const chevron = document.getElementById(`${sectionId}-chevron`);
+
+                if (content) {
+                    content.classList.add('collapsed');
+                }
+                if (chevron) {
+                    chevron.classList.add('collapsed');
+                }
+            });
+        }
+
+        // Handle ESC key to close modal
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && currentOutputFeatureId) {
+                closeOutputModal();
+            }
+        });
+
+        // Update elapsed time every second
+        setInterval(updateElapsedTime, 1000);
+
+        // Initial load
+        document.addEventListener('DOMContentLoaded', () => {
+            // Restore collapsed sections on mobile
+            restoreCollapsedSections();
+
+            // First, do an initial fetch to populate the UI quickly
+            fetchData().then(() => {
+                // Then try to connect to SSE for real-time updates
+                if (useSSE) {
+                    connectSSE();
+                } else {
+                    startAutoRefresh();
+                }
+            });
+        });
+
+        // Clean up on page unload
+        window.addEventListener('beforeunload', () => {
+            disconnectSSE();
+            stopAutoRefresh();
+        });
+    </script>
+</body>
+</html>

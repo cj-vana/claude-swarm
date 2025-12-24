@@ -1,0 +1,37 @@
+{
+  "name": "claude-swarm",
+  "version": "0.1.0",
+  "description": "MCP server for orchestrating parallel Claude Code worker swarms",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "claude-swarm": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc && cp -r src/dashboard/public dist/dashboard/",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "inspector": "npx @anthropics/mcp-inspector node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "claude",
+    "swarm",
+    "orchestrator",
+    "parallel",
+    "autonomous",
+    "coding-agent"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "express": "^5.2.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
