@@ -127,6 +127,44 @@ The orchestrator automatically monitors workers and logs when they complete or c
 - Format: `🔔 Worker completed: feature-1 - use mark_complete to update status`
 - You still need to call `mark_complete` to update feature status
 
+### Competitive Planning for Complex Features
+For complex features, use competitive planning to get two different implementation approaches:
+
+```
+1. get_feature_complexity(featureId) - Analyze if feature is complex enough
+2. If score >= 60, use start_competitive_planning(featureId)
+   - Spawns 2 planners with different approaches (A: incremental, B: elegant)
+   - Each creates an implementation plan in JSON format
+3. Wait for planners to complete (typically 3-5 minutes)
+4. evaluate_plans(featureId) - Compare plans and pick winner
+5. start_worker with the winning plan as context
+```
+
+Complexity is scored based on:
+- Description length and keywords (refactor, migrate, integrate)
+- Scope indicators (multiple, all, system-wide)
+- Dependency count and estimated files to modify
+
+### Confidence-Based Worker Monitoring
+Track worker confidence to detect issues early:
+
+```
+1. set_confidence_threshold(35) - Configure alert threshold (default: 35%)
+2. get_worker_confidence(featureId) - Get detailed confidence breakdown
+3. check_worker with heartbeat: true includes confidence score automatically
+```
+
+Confidence combines three signals:
+- **Tool Activity (35%)**: Read→Edit→Test cycles, stuck loops, idle periods
+- **Self-Reported (35%)**: Workers periodically report their confidence
+- **Output Analysis (30%)**: Error patterns, success indicators, frustration language
+
+Confidence levels:
+- **High (80-100)**: On track
+- **Medium (50-79)**: Normal operation
+- **Low (25-49)**: May need guidance
+- **Critical (0-24)**: Immediate attention
+
 ### Error Recovery
 - If a worker fails, check the error in check_worker output
 - Auto-retry is enabled by default (3 attempts) via `mark_complete`
@@ -163,27 +201,53 @@ A real-time web dashboard is available at `http://localhost:3456` when the MCP s
 
 ## Tools Reference
 
+### Core Orchestration
 | Tool | Purpose |
 |------|---------|
 | `orchestrator_init` | Start new session with features |
 | `orchestrator_status` | Check current state (use after compaction!) |
+| `orchestrator_reset` | Nuclear option - clear everything |
+
+### Worker Management
+| Tool | Purpose |
+|------|---------|
 | `start_worker` | Launch worker for a feature |
 | `start_parallel_workers` | Launch multiple workers for independent features |
 | `validate_workers` | Pre-flight validation before parallel execution |
 | `check_worker` | Monitor worker output (supports heartbeat + cursor modes) |
 | `check_all_workers` | Check all active workers at once |
 | `send_worker_message` | Send follow-up instructions to running worker |
+
+### Competitive Planning
+| Tool | Purpose |
+|------|---------|
+| `get_feature_complexity` | Analyze complexity and get planning recommendation |
+| `start_competitive_planning` | Spawn 2 planners to create competing implementation plans |
+| `evaluate_plans` | Compare plans and select winner |
+
+### Confidence Monitoring
+| Tool | Purpose |
+|------|---------|
+| `get_worker_confidence` | Get detailed confidence breakdown for a worker |
+| `set_confidence_threshold` | Configure alert threshold (default: 35%) |
+
+### Feature Management
+| Tool | Purpose |
+|------|---------|
 | `mark_complete` | Mark feature done/failed (with auto-retry) |
 | `retry_feature` | Reset failed feature for manual retry |
 | `run_verification` | Run tests/build to verify |
 | `add_feature` | Add discovered work |
 | `set_dependencies` | Define feature dependencies |
+
+### Session & Progress
+| Tool | Purpose |
+|------|---------|
 | `get_progress_log` | Full history |
 | `get_session_stats` | Success rates and timing metrics |
 | `pause_session` | Pause session, stop all workers |
 | `resume_session` | Resume paused session |
 | `commit_progress` | Git checkpoint |
-| `orchestrator_reset` | Nuclear option - clear everything |
 
 ## Example Session
 

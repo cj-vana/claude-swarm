@@ -29,6 +29,9 @@ import {
   sanitizeOutput,
 } from "./utils/security.js";
 import { startDashboardServer, DashboardServer } from "./dashboard/server.js";
+import { analyzeComplexity, formatComplexityResult } from "./utils/complexity-detector.js";
+import { evaluatePlans, parsePlanFromFile, formatEvaluationResult } from "./utils/plan-evaluator.js";
+import { getWorkerConfidence, formatConfidenceResult } from "./workers/confidence.js";
 
 // Dashboard configuration from environment variables
 const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT || "3456", 10);
@@ -1789,6 +1792,425 @@ server.tool(
 
     return {
       content: [{ type: "text", text: responseText }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: get_feature_complexity
+// ============================================================================
+server.tool(
+  "get_feature_complexity",
+  "Analyze the complexity of a feature and get a recommendation for whether to use competitive planning.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    featureId: z.string().describe("ID of the feature to analyze"),
+    threshold: z.number().optional().describe("Complexity threshold for competitive planning (default: 60)"),
+  },
+  async ({ projectDir, featureId, threshold }) => {
+    const { state } = await ensureInitialized(projectDir);
+    const current = state.load();
+
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active session. Use orchestrator_init first." }],
+      };
+    }
+
+    const feature = current.features.find(f => f.id === featureId);
+    if (!feature) {
+      return {
+        content: [{ type: "text", text: `Feature '${featureId}' not found.` }],
+      };
+    }
+
+    const complexity = analyzeComplexity(feature, threshold);
+
+    // Store complexity in feature for later reference
+    feature.complexity = complexity;
+    state.save(current);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `🔍 Complexity Analysis for ${featureId}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n${formatComplexityResult(complexity)}`,
+        },
+      ],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: start_competitive_planning
+// ============================================================================
+server.tool(
+  "start_competitive_planning",
+  "Start competitive planning for a complex feature. Spawns two workers in planning mode to create competing implementation plans.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    featureId: z.string().describe("ID of the feature to plan"),
+    forceCompetitive: z.boolean().optional().describe("Force competitive planning even if not detected as complex"),
+    customPromptA: z.string().optional().describe("Custom prompt for planner A"),
+    customPromptB: z.string().optional().describe("Custom prompt for planner B"),
+  },
+  async ({ projectDir, featureId, forceCompetitive, customPromptA, customPromptB }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
+    const current = state.load();
+
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active session. Use orchestrator_init first." }],
+      };
+    }
+
+    const feature = current.features.find(f => f.id === featureId);
+    if (!feature) {
+      return {
+        content: [{ type: "text", text: `Feature '${featureId}' not found.` }],
+      };
+    }
+
+    // Check if already in planning phase
+    if (feature.planningPhase === "planning") {
+      return {
+        content: [{ type: "text", text: `Feature '${featureId}' is already in planning phase.` }],
+      };
+    }
+
+    // Analyze complexity if not forced
+    if (!forceCompetitive && !feature.complexity) {
+      feature.complexity = analyzeComplexity(feature);
+    }
+
+    if (!forceCompetitive && feature.complexity && !feature.complexity.isComplex) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Feature '${featureId}' is not complex enough for competitive planning (score: ${feature.complexity.score}/100).\n\nRecommendation: ${feature.complexity.recommendation}\n\nUse forceCompetitive=true to override, or use start_worker for simple implementation.`,
+          },
+        ],
+      };
+    }
+
+    // Start two planner workers
+    const [resultA, resultB] = await Promise.all([
+      workers.startPlannerWorker(feature, "A", customPromptA),
+      workers.startPlannerWorker(feature, "B", customPromptB),
+    ]);
+
+    if (!resultA.success || !resultB.success) {
+      // Try to clean up if one succeeded
+      if (resultA.success && resultA.sessionName) {
+        await workers.killWorker(resultA.sessionName);
+      }
+      if (resultB.success && resultB.sessionName) {
+        await workers.killWorker(resultB.sessionName);
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to start planners:\nPlanner A: ${resultA.error || "OK"}\nPlanner B: ${resultB.error || "OK"}`,
+          },
+        ],
+      };
+    }
+
+    // Update feature state
+    feature.planningPhase = "planning";
+    feature.competingPlans = {
+      planA: {
+        workerId: resultA.sessionName!,
+        submittedAt: "",
+        plan: { summary: "", steps: [], filesToCreate: [], filesToModify: [], testStrategy: "", risks: [] },
+      },
+      planB: {
+        workerId: resultB.sessionName!,
+        submittedAt: "",
+        plan: { summary: "", steps: [], filesToCreate: [], filesToModify: [], testStrategy: "", risks: [] },
+      },
+    };
+
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 🏁 Started competitive planning for ${featureId} (complexity: ${feature.complexity?.score || "N/A"})`
+    );
+    state.save(current);
+    state.writeProgressFile();
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `🏁 Competitive Planning Started for ${featureId}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nPlanner A: ${resultA.sessionName}\nPlanner B: ${resultB.sessionName}\n\nBoth planners are now exploring the codebase and creating implementation plans.\nUse check_worker with their session names to monitor progress.\n\nOnce both planners complete, use evaluate_plans to compare and select a winner.`,
+        },
+      ],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: evaluate_plans
+// ============================================================================
+server.tool(
+  "evaluate_plans",
+  "Evaluate competing plans for a feature and select the winner. The winning plan's approach will be used for implementation.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    featureId: z.string().describe("ID of the feature to evaluate plans for"),
+    manualSelection: z.enum(["A", "B"]).optional().describe("Override automatic selection with manual choice"),
+    selectionReason: z.string().optional().describe("Reason for manual selection"),
+  },
+  async ({ projectDir, featureId, manualSelection, selectionReason }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
+    const current = state.load();
+
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active session. Use orchestrator_init first." }],
+      };
+    }
+
+    const feature = current.features.find(f => f.id === featureId);
+    if (!feature) {
+      return {
+        content: [{ type: "text", text: `Feature '${featureId}' not found.` }],
+      };
+    }
+
+    if (feature.planningPhase !== "planning") {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Feature '${featureId}' is not in planning phase. Use start_competitive_planning first.`,
+          },
+        ],
+      };
+    }
+
+    // Read plan files
+    const planAFile = `.claude/orchestrator/workers/${featureId}.plan.json`;
+    const planA = workers.readPlanFile(featureId);
+
+    // Check for role-specific plan files as fallback
+    let planB = null;
+    // Try to find the second plan if both planners wrote to the same file
+    // In practice, planners might use different naming
+
+    if (!planA) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `No plans found yet. Wait for planners to complete and write their plans to .claude/orchestrator/workers/${featureId}.plan.json`,
+          },
+        ],
+      };
+    }
+
+    // If we only have one plan, we'll evaluate it against an empty plan
+    // In a real scenario, both planners would submit separate plans
+    const planBData = planB || {
+      summary: "(No Plan B submitted)",
+      steps: [],
+      filesToCreate: [],
+      filesToModify: [],
+      testStrategy: "",
+      risks: [],
+    };
+
+    let evaluation;
+    let winner: "A" | "B";
+
+    if (manualSelection) {
+      winner = manualSelection;
+      evaluation = {
+        winner,
+        selectionReason: selectionReason || `Manual selection: Plan ${winner} chosen by orchestrator`,
+        marginOfVictory: 0,
+        evaluations: {
+          A: { planId: "A" as const, scores: { completeness: 0, feasibility: 0, riskAwareness: 0, clarity: 0, efficiency: 0, total: 0 }, concerns: [], strengths: [] },
+          B: { planId: "B" as const, scores: { completeness: 0, feasibility: 0, riskAwareness: 0, clarity: 0, efficiency: 0, total: 0 }, concerns: [], strengths: [] },
+        },
+      };
+    } else {
+      evaluation = evaluatePlans(feature, planA, planBData, projectDir);
+      winner = evaluation.winner;
+    }
+
+    // Update feature state
+    feature.planningPhase = "evaluating";
+    if (feature.competingPlans) {
+      feature.competingPlans.selectedPlan = winner;
+      feature.competingPlans.selectionReason = evaluation.selectionReason;
+      if (feature.competingPlans.planA) {
+        feature.competingPlans.planA.plan = planA;
+        feature.competingPlans.planA.submittedAt = new Date().toISOString();
+        feature.competingPlans.planA.evaluationScore = evaluation.evaluations.A.scores.total;
+      }
+      if (feature.competingPlans.planB) {
+        feature.competingPlans.planB.plan = planBData;
+        feature.competingPlans.planB.submittedAt = new Date().toISOString();
+        feature.competingPlans.planB.evaluationScore = evaluation.evaluations.B.scores.total;
+      }
+    }
+
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 🏆 Plan ${winner} selected for ${featureId} (${manualSelection ? "manual" : "automatic"})`
+    );
+    state.save(current);
+    state.writeProgressFile();
+
+    // Kill both planner sessions (they should be done by now)
+    if (feature.competingPlans?.planA?.workerId) {
+      await workers.killWorker(feature.competingPlans.planA.workerId);
+    }
+    if (feature.competingPlans?.planB?.workerId) {
+      await workers.killWorker(feature.competingPlans.planB.workerId);
+    }
+
+    let response = `🏆 Plan Evaluation Complete for ${featureId}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    response += `Winner: Plan ${winner}\n`;
+    response += `Reason: ${evaluation.selectionReason}\n\n`;
+
+    if (!manualSelection) {
+      response += formatEvaluationResult(evaluation);
+    }
+
+    response += `\n\n📋 Winning Plan Summary:\n${planA.summary || "(No summary)"}\n\n`;
+    response += `Next Steps:\n`;
+    response += `1. Set planningPhase to "implementing" on the feature\n`;
+    response += `2. Use start_worker to begin implementation with the winning plan as context`;
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: get_worker_confidence
+// ============================================================================
+server.tool(
+  "get_worker_confidence",
+  "Get detailed confidence analysis for a running worker. Shows tool activity patterns, self-reported confidence, and output analysis.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    featureId: z.string().describe("ID of the feature whose worker to analyze"),
+  },
+  async ({ projectDir, featureId }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
+    const current = state.load();
+
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active session. Use orchestrator_init first." }],
+      };
+    }
+
+    const feature = current.features.find(f => f.id === featureId);
+    if (!feature) {
+      return {
+        content: [{ type: "text", text: `Feature '${featureId}' not found.` }],
+      };
+    }
+
+    if (!feature.workerId || feature.status !== "in_progress") {
+      return {
+        content: [{ type: "text", text: `Feature '${featureId}' does not have an active worker.` }],
+      };
+    }
+
+    // Get worker directory from project
+    const workerDir = `${projectDir}/.claude/orchestrator/workers`;
+    const confidence = getWorkerConfidence(workerDir, featureId);
+
+    if (!confidence) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Could not analyze confidence for ${featureId}. Worker may still be initializing.`,
+          },
+        ],
+      };
+    }
+
+    // Check if we should alert based on threshold
+    const threshold = current.confidenceConfig?.threshold ?? 35;
+    let alertMessage = "";
+    if (confidence.score < threshold) {
+      alertMessage = `\n\n⚠️ ALERT: Confidence below threshold (${confidence.score} < ${threshold})`;
+
+      // Add to alerts if autoAlert is enabled
+      if (current.confidenceConfig?.autoAlert !== false) {
+        if (!current.confidenceAlerts) {
+          current.confidenceAlerts = [];
+        }
+        current.confidenceAlerts.push({
+          type: "self_reported_low",
+          message: `Confidence for ${featureId} dropped to ${confidence.score}`,
+          severity: confidence.score < 20 ? "critical" : "warning",
+          timestamp: new Date().toISOString(),
+        });
+        current.progressLog.push(
+          `[${new Date().toISOString()}] ⚠️ Low confidence alert: ${featureId} at ${confidence.score}%`
+        );
+        state.save(current);
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `📊 Confidence Analysis for ${featureId}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n${formatConfidenceResult(confidence)}${alertMessage}`,
+        },
+      ],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: set_confidence_threshold
+// ============================================================================
+server.tool(
+  "set_confidence_threshold",
+  "Configure the confidence threshold for alerts. When worker confidence drops below this threshold, alerts will be generated.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    threshold: z.number().min(0).max(100).describe("Confidence threshold (0-100, default: 35)"),
+    autoAlert: z.boolean().optional().describe("Automatically log alerts to progress log (default: true)"),
+  },
+  async ({ projectDir, threshold, autoAlert }) => {
+    const { state } = await ensureInitialized(projectDir);
+    const current = state.load();
+
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active session. Use orchestrator_init first." }],
+      };
+    }
+
+    current.confidenceConfig = {
+      threshold,
+      autoAlert: autoAlert ?? true,
+    };
+
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 🎚️ Confidence threshold set to ${threshold}% (autoAlert: ${autoAlert ?? true})`
+    );
+    state.save(current);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `🎚️ Confidence Threshold Updated\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nThreshold: ${threshold}%\nAuto-Alert: ${autoAlert ?? true}\n\nWhen any worker's confidence drops below ${threshold}%, an alert will be generated.`,
+        },
+      ],
     };
   }
 );

@@ -85,9 +85,10 @@ export function validateFeatureId(id: string): string {
 
 /**
  * Validate tmux session name
+ * Supports both worker sessions (cc-worker-*) and planner sessions (cc-planner-*)
  */
 export function validateSessionName(name: string): boolean {
-  return /^cc-worker-[a-zA-Z0-9_-]+-[a-z0-9]+$/.test(name);
+  return /^cc-(worker|planner)-[a-zA-Z0-9_-]+-[a-z0-9]+$/.test(name);
 }
 
 /**
@@ -201,6 +202,80 @@ export function sanitizeOutput(output: string, maxLength: number = 5000): string
 }
 
 /**
+ * Zod schema for complexity signals
+ */
+export const ComplexitySignalsSchema = z.object({
+  descriptionLength: z.number(),
+  keywordMatches: z.array(z.string()),
+  scopeIndicators: z.array(z.string()),
+  architecturalTerms: z.array(z.string()),
+  uncertaintyIndicators: z.array(z.string()),
+  dependencyCount: z.number(),
+  estimatedTouchPoints: z.number(),
+});
+
+/**
+ * Zod schema for complexity result
+ */
+export const ComplexityResultSchema = z.object({
+  score: z.number(),
+  isComplex: z.boolean(),
+  signals: ComplexitySignalsSchema,
+  recommendation: z.enum(["simple", "competitive_planning", "manual_review"]),
+  breakdown: z.object({
+    lengthScore: z.number(),
+    keywordScore: z.number(),
+    scopeScore: z.number(),
+    dependencyScore: z.number(),
+    touchPointScore: z.number(),
+  }),
+});
+
+/**
+ * Zod schema for plan step
+ */
+export const PlanStepSchema = z.object({
+  order: z.number(),
+  description: z.string(),
+  files: z.array(z.string()),
+  validation: z.string().optional(),
+});
+
+/**
+ * Zod schema for structured plan
+ */
+export const StructuredPlanSchema = z.object({
+  summary: z.string(),
+  steps: z.array(PlanStepSchema),
+  filesToCreate: z.array(z.string()),
+  filesToModify: z.array(z.string()),
+  testStrategy: z.string(),
+  risks: z.array(z.string()),
+  estimatedComplexity: z.enum(["low", "medium", "high"]).optional(),
+  dependencies: z.array(z.string()).optional(),
+});
+
+/**
+ * Zod schema for plan submission
+ */
+export const PlanSubmissionSchema = z.object({
+  workerId: z.string(),
+  submittedAt: z.string(),
+  plan: StructuredPlanSchema,
+  evaluationScore: z.number().optional(),
+});
+
+/**
+ * Zod schema for competing plans
+ */
+export const CompetingPlansSchema = z.object({
+  planA: PlanSubmissionSchema.optional(),
+  planB: PlanSubmissionSchema.optional(),
+  selectedPlan: z.enum(["A", "B"]).optional(),
+  selectionReason: z.string().optional(),
+});
+
+/**
  * Zod schema for validating feature structure
  */
 export const FeatureSchema = z.object({
@@ -214,6 +289,28 @@ export const FeatureSchema = z.object({
   lastError: z.string().optional(),
   notes: z.string().optional(),
   dependsOn: z.array(z.string().regex(/^[a-zA-Z0-9_-]+$/)).optional(),
+  // Competitive planning fields
+  complexity: ComplexityResultSchema.optional(),
+  planningPhase: z.enum(["planning", "evaluating", "implementing"]).nullable().optional(),
+  competingPlans: CompetingPlansSchema.optional(),
+});
+
+/**
+ * Zod schema for confidence alert
+ */
+export const ConfidenceAlertSchema = z.object({
+  type: z.enum(["idle", "stuck_loop", "high_errors", "self_reported_low", "declining_trend"]),
+  message: z.string(),
+  severity: z.enum(["warning", "critical"]),
+  timestamp: z.string(),
+});
+
+/**
+ * Zod schema for confidence config
+ */
+export const ConfidenceConfigSchema = z.object({
+  threshold: z.number().min(0).max(100),
+  autoAlert: z.boolean(),
 });
 
 /**
@@ -242,4 +339,7 @@ export const OrchestratorStateSchema = z.object({
   lastUpdated: z.string(),
   completedAt: z.string().optional(),
   progressLog: z.array(z.string()),
+  // Confidence monitoring
+  confidenceConfig: ConfidenceConfigSchema.optional(),
+  confidenceAlerts: z.array(ConfidenceAlertSchema).optional(),
 });

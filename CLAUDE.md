@@ -11,46 +11,52 @@ npm start          # Run the compiled MCP server
 npm run inspector  # Debug with MCP Inspector
 ```
 
+**Install the MCP server** into Claude Code:
+```bash
+claude mcp add claude-swarm --scope user -- node $(pwd)/dist/index.js
+```
+
+**Install the /swarm skill** for guided orchestration:
+```bash
+mkdir -p ~/.claude/skills/swarm && cp skill/SKILL.md ~/.claude/skills/swarm/
+```
+
 ## Architecture Overview
 
 This is an MCP (Model Context Protocol) server that orchestrates parallel Claude Code worker swarms via tmux sessions. The pattern separates concerns between an orchestrator (which plans and monitors) and workers (which implement individual features).
 
 ### Core Components
 
-**src/index.ts** - MCP server entry point and all tool definitions. Registers 20 MCP tools for session management, worker control, verification, and state access.
+**src/index.ts** - MCP server entry point registering 20 tools. All tool handlers are defined inline here. Tool schemas use Zod for validation.
 
-**src/state/manager.ts** - Persistent state management. Stores orchestrator state (features, workers, progress log) in `.claude/orchestrator/state.json`. Uses atomic file writes and Zod schema validation. Implements the "notebook pattern" with human-readable progress files.
+**src/state/manager.ts** - Persistent state management using the "notebook pattern". Stores session state in `.claude/orchestrator/state.json` with atomic writes (temp file + rename). Also generates `claude-progress.txt` for human readability and `init.sh` for environment setup.
 
-**src/workers/manager.ts** - Manages Claude Code worker sessions via tmux. Each worker runs in isolation with prompts passed via files (not shell strings) to prevent injection. Includes completion monitoring, heartbeat tracking, and conflict analysis for parallel execution.
+**src/workers/manager.ts** - Manages Claude Code worker sessions via tmux. Key security pattern: prompts are passed via files (not shell strings) to prevent injection. Includes completion monitoring (10s polling), heartbeat tracking, and conflict analysis for parallel execution.
 
-**src/dashboard/server.ts** - Express HTTP server providing REST API and SSE endpoints for real-time monitoring. Serves the dashboard UI at `http://localhost:3456`.
+**src/dashboard/server.ts** - Express 5 HTTP server with REST API and SSE endpoints for real-time monitoring. Dashboard UI served from `src/dashboard/public/`.
 
-**src/utils/security.ts** - Input validation and sanitization. Validates project directories (prevents traversal), feature IDs, session names, and verification commands (allowlist only).
+**src/utils/security.ts** - Security utilities: path traversal prevention, feature ID validation, session name validation, command allowlist enforcement, and output sanitization. The `ALLOWED_COMMAND_PATTERNS` regex list controls which verification commands can run.
+
+**src/utils/format.ts** - Duration formatting and percentage calculation helpers.
 
 ### Key Design Patterns
 
 1. **Persistent State Outside Context** - State survives Claude's context compaction via the MCP server
-2. **Worker Isolation** - Each worker runs in its own tmux session with controlled tool access
+2. **Worker Isolation** - Each worker runs in its own tmux session with controlled tool access (`Bash,Read,Write,Edit,Glob,Grep`)
 3. **Atomic File Operations** - State and progress files use write-to-temp-then-rename pattern
 4. **Command Allowlist** - Only safe verification commands (npm test, pytest, etc.) can be executed
+5. **File-Based Prompt Passing** - Worker prompts written to `.prompt` files, not shell strings
 
 ### State Files Created Per Project
 
-- `.claude/orchestrator/state.json` - Main session state
-- `.claude/orchestrator/feature_list.json` - Feature status
-- `.claude/orchestrator/workers/*.prompt|.log|.done|.status` - Per-worker files
+- `.claude/orchestrator/state.json` - Main session state (Zod-validated on load)
+- `.claude/orchestrator/feature_list.json` - Feature status for structured access
+- `.claude/orchestrator/workers/*.prompt` - Worker prompts (mode 0600)
+- `.claude/orchestrator/workers/*.log` - Worker output logs
+- `.claude/orchestrator/workers/*.done` - Completion marker files
+- `.claude/orchestrator/workers/*.status` - Worker status JSON
 - `claude-progress.txt` - Human-readable progress log
-- `init.sh` - Environment setup script
-
-## MCP Tool Categories
-
-**Session**: `orchestrator_init`, `orchestrator_status`, `orchestrator_reset`, `pause_session`, `resume_session`
-
-**Workers**: `start_worker`, `start_parallel_workers`, `validate_workers`, `check_worker`, `check_all_workers`, `send_worker_message`
-
-**Features**: `mark_complete`, `retry_feature`, `add_feature`, `set_dependencies`
-
-**Utilities**: `run_verification`, `get_progress_log`, `get_session_stats`, `commit_progress`
+- `init.sh` - Environment setup script (mode 0700)
 
 ## Configuration
 
@@ -62,3 +68,19 @@ This is an MCP (Model Context Protocol) server that orchestrates parallel Claude
 ## Dependencies
 
 Requires tmux for worker session management (`brew install tmux` on macOS).
+
+## Debugging
+
+```bash
+# View active tmux sessions
+tmux list-sessions
+
+# Attach to a worker session
+tmux attach -t cc-worker-feature-1-abc123
+
+# Capture worker output
+tmux capture-pane -t <session-name> -p -S -100
+
+# Debug MCP protocol with inspector
+npm run inspector
+```

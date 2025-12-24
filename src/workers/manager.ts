@@ -24,6 +24,10 @@ import {
   shellQuote,
   sanitizeOutput,
 } from "../utils/security.js";
+import {
+  getWorkerConfidence,
+  AggregatedConfidence,
+} from "./confidence.js";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -47,6 +51,7 @@ export interface HeartbeatInfo {
   linesWritten: number;
   filesModified: string[];
   runningFor?: string;
+  confidence?: AggregatedConfidence;
 }
 
 export type CompletionCallback = (
@@ -174,6 +179,212 @@ ${customPrompt ? `\n## Additional Context\n${customPrompt}` : ""}
 Begin implementing the feature now.`;
 
     return prompt;
+  }
+
+  /**
+   * Build a specialized prompt for planning mode workers
+   * These workers create implementation plans without writing code
+   */
+  private buildPlannerPrompt(
+    feature: Feature,
+    role: "A" | "B",
+    customPrompt?: string
+  ): string {
+    const state = this.stateManager.load();
+    const taskContext = state?.taskDescription || "";
+    const projectContext = this.readProjectContext();
+
+    // Different perspectives based on role
+    const roleGuidance =
+      role === "A"
+        ? "Consider a straightforward, incremental approach. Focus on minimizing risk and using established patterns."
+        : "Consider an alternative or more elegant approach. Look for opportunities to simplify or improve the architecture.";
+
+    const prompt = `You are a planning agent focused on creating an implementation plan for a feature.
+Your role is to analyze the codebase and create a detailed plan - DO NOT implement any code.
+
+## Your Task
+Create an implementation plan for: ${feature.description}
+
+## Planning Approach
+${roleGuidance}
+
+## Orchestration Context
+${taskContext}
+${projectContext}
+
+## Instructions
+1. Explore the codebase to understand the current architecture
+2. Identify the files that need to be created or modified
+3. Create a step-by-step implementation plan
+4. Identify potential risks and how to mitigate them
+5. Output your plan as a JSON file
+
+## Output Format
+Create a file at: .claude/orchestrator/workers/${feature.id}.plan.json
+
+The JSON must follow this structure:
+{
+  "summary": "One paragraph overview of the approach",
+  "steps": [
+    {
+      "order": 1,
+      "description": "What to do in this step",
+      "files": ["src/file1.ts", "src/file2.ts"],
+      "validation": "How to verify this step is complete"
+    }
+  ],
+  "filesToCreate": ["src/newfile.ts"],
+  "filesToModify": ["src/existing.ts"],
+  "testStrategy": "How to test the implementation",
+  "risks": ["Risk 1: description and mitigation", "Risk 2: ..."],
+  "estimatedComplexity": "low" | "medium" | "high"
+}
+
+## Important
+- You are in PLANNING mode - do NOT write any implementation code
+- Use Read, Glob, and Grep tools to explore the codebase
+- Focus on understanding existing patterns and conventions
+- Your plan will be evaluated against another planner's approach
+- The winning plan will be used for implementation
+
+${customPrompt ? `\n## Additional Context\n${customPrompt}` : ""}
+
+Begin exploring and planning now.`;
+
+    return prompt;
+  }
+
+  /**
+   * Start a worker in planning mode
+   * Returns a unique session name for tracking
+   */
+  async startPlannerWorker(
+    feature: Feature,
+    role: "A" | "B",
+    customPrompt?: string
+  ): Promise<StartWorkerResult> {
+    // Validate feature ID
+    try {
+      validateFeatureId(feature.id);
+    } catch (error: any) {
+      return {
+        success: false,
+        error: `Invalid feature ID: ${error.message}`,
+      };
+    }
+
+    // Use role suffix in session name to distinguish planners
+    const timestamp = Date.now().toString(36);
+    const sessionName = `cc-planner-${feature.id}-${role.toLowerCase()}-${timestamp}`;
+    const prompt = this.buildPlannerPrompt(feature, role, customPrompt);
+
+    // Check if tmux is available
+    try {
+      await execFileAsync("which", ["tmux"]);
+    } catch {
+      return {
+        success: false,
+        error: "tmux is not installed. Please install tmux first.",
+      };
+    }
+
+    try {
+      // Write prompt to a file
+      const promptFile = path.join(
+        this.workerDir,
+        `${feature.id}.planner-${role.toLowerCase()}.prompt`
+      );
+      fs.writeFileSync(promptFile, prompt, { mode: 0o600 });
+
+      const logFile = path.join(
+        this.workerDir,
+        `${feature.id}.planner-${role.toLowerCase()}.log`
+      );
+
+      // Create wrapper script with read-only tools only
+      const wrapperScript = path.join(
+        this.workerDir,
+        `${feature.id}.planner-${role.toLowerCase()}.sh`
+      );
+      const scriptContent = `#!/bin/bash
+set -e
+cd ${shellQuote(this.projectDir)}
+PROMPT=$(cat ${shellQuote(promptFile)})
+# Planning mode: only read-only tools plus Write for the plan file
+claude -p "$PROMPT" --allowedTools Read,Glob,Grep,Write 2>&1 | tee ${shellQuote(logFile)}
+echo 'PLANNER_EXITED' >> ${shellQuote(logFile)}
+`;
+      fs.writeFileSync(wrapperScript, scriptContent, { mode: 0o700 });
+
+      // Start tmux session
+      await execFileAsync("tmux", [
+        "new-session",
+        "-d",
+        "-s",
+        sessionName,
+        "-c",
+        this.projectDir,
+        "bash",
+        wrapperScript,
+      ]);
+
+      // Create status file
+      const statusFile = path.join(
+        this.workerDir,
+        `${feature.id}.planner-${role.toLowerCase()}.status`
+      );
+      fs.writeFileSync(
+        statusFile,
+        JSON.stringify({
+          sessionName,
+          featureId: feature.id,
+          role,
+          startedAt: new Date().toISOString(),
+          status: "running",
+          mode: "planning",
+        })
+      );
+
+      return {
+        success: true,
+        sessionName,
+      };
+    } catch (error: any) {
+      return {
+        success: false,
+        error: sanitizeOutput(error.message),
+      };
+    }
+  }
+
+  /**
+   * Check if a plan file exists for a feature/role
+   */
+  planExists(featureId: string, role: "A" | "B"): boolean {
+    const planFile = path.join(this.workerDir, `${featureId}.plan.json`);
+    // Also check role-specific plan file
+    const rolePlanFile = path.join(
+      this.workerDir,
+      `${featureId}.planner-${role.toLowerCase()}.plan.json`
+    );
+    return fs.existsSync(planFile) || fs.existsSync(rolePlanFile);
+  }
+
+  /**
+   * Read a plan file for a feature
+   */
+  readPlanFile(featureId: string): any | null {
+    const planFile = path.join(this.workerDir, `${featureId}.plan.json`);
+    try {
+      if (fs.existsSync(planFile)) {
+        const content = fs.readFileSync(planFile, "utf-8");
+        return JSON.parse(content);
+      }
+    } catch {
+      // Return null if parsing fails
+    }
+    return null;
   }
 
   /**
@@ -510,6 +721,15 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
       runningFor = `${mins}m ${secs}s`;
     }
 
+    // Get confidence score
+    let confidence: AggregatedConfidence | undefined;
+    if (basicResult.status === "running") {
+      const confidenceResult = getWorkerConfidence(this.workerDir, featureId);
+      if (confidenceResult) {
+        confidence = confidenceResult;
+      }
+    }
+
     return {
       status: basicResult.status,
       lastToolUsed,
@@ -518,6 +738,7 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
       linesWritten,
       filesModified: Array.from(filesModified).slice(0, 10), // Limit to 10 files
       runningFor,
+      confidence,
     };
   }
 

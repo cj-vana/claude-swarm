@@ -23,6 +23,10 @@ import {
   sanitizeOutput,
 } from "../utils/security.js";
 
+import { ComplexityResult } from "../utils/complexity-detector.js";
+import { PlanSubmission } from "../utils/plan-evaluator.js";
+import { ConfidenceAlert } from "../workers/confidence.js";
+
 export interface Feature {
   id: string;
   description: string;
@@ -34,6 +38,16 @@ export interface Feature {
   lastError?: string;
   notes?: string;
   dependsOn?: string[]; // Array of feature IDs this feature depends on
+
+  // Competitive planning fields
+  complexity?: ComplexityResult;
+  planningPhase?: "planning" | "evaluating" | "implementing" | null;
+  competingPlans?: {
+    planA?: PlanSubmission;
+    planB?: PlanSubmission;
+    selectedPlan?: "A" | "B";
+    selectionReason?: string;
+  };
 }
 
 export interface WorkerStatus {
@@ -42,6 +56,11 @@ export interface WorkerStatus {
   status: "running" | "completed" | "crashed" | "unknown";
   startedAt: string;
   lastChecked?: string;
+}
+
+export interface ConfidenceConfig {
+  threshold: number; // 0-100, default 35
+  autoAlert: boolean; // Log alerts to progressLog automatically
 }
 
 export interface OrchestratorState {
@@ -54,6 +73,10 @@ export interface OrchestratorState {
   lastUpdated: string;
   completedAt?: string;
   progressLog: string[];
+
+  // Confidence monitoring
+  confidenceConfig?: ConfidenceConfig;
+  confidenceAlerts?: ConfidenceAlert[];
 }
 
 // Maximum number of log entries to keep (prevents unbounded growth)
