@@ -52,7 +52,7 @@ interface StateSnapshot {
  * Start the dashboard HTTP server
  */
 export async function startDashboardServer(
-  stateManager: StateManager,
+  getStateManager: () => StateManager | null,
   options: DashboardServerOptions = {}
 ): Promise<DashboardServer> {
   const port = options.port || 3456;
@@ -106,6 +106,12 @@ export async function startDashboardServer(
       logCount: state.progressLog.length,
       workerCount,
     };
+  };
+
+  // Helper to get current state manager
+  const getState = () => {
+    const sm = getStateManager();
+    return sm ? sm.load() : null;
   };
 
   // Detect and broadcast changes between snapshots
@@ -177,7 +183,7 @@ export async function startDashboardServer(
         return;
       }
 
-      const state = stateManager.load();
+      const state = getState();
       const newSnapshot = createSnapshot(state);
       detectAndBroadcastChanges(lastSnapshot, newSnapshot, state);
       lastSnapshot = newSnapshot;
@@ -227,7 +233,7 @@ export async function startDashboardServer(
   app.get(
     "/api/status",
     asyncHandler(async (req: Request, res: Response) => {
-      const state = stateManager.load();
+      const state = getState();
 
       if (!state) {
         sendJson(res, {
@@ -280,7 +286,7 @@ export async function startDashboardServer(
   app.get(
     "/api/features",
     asyncHandler(async (req: Request, res: Response) => {
-      const state = stateManager.load();
+      const state = getState();
 
       if (!state) {
         sendJson(res, {
@@ -325,7 +331,7 @@ export async function startDashboardServer(
   app.get(
     "/api/workers",
     asyncHandler(async (req: Request, res: Response) => {
-      const state = stateManager.load();
+      const state = getState();
 
       if (!state) {
         sendJson(res, {
@@ -336,7 +342,15 @@ export async function startDashboardServer(
       }
 
       // Create a temporary WorkerManager to check worker statuses
-      const workerManager = new WorkerManager(stateManager.projectDir, stateManager);
+      const sm = getStateManager();
+      if (!sm) {
+        sendJson(res, {
+          workers: [],
+          message: "No state manager available",
+        });
+        return;
+      }
+      const workerManager = new WorkerManager(sm.projectDir, sm);
       const workerStatuses = await workerManager.checkAllWorkers();
 
       const workerData = workerStatuses.map((w) => {
@@ -375,7 +389,7 @@ export async function startDashboardServer(
     "/api/workers/:featureId/output",
     asyncHandler(async (req: Request, res: Response) => {
       const featureId = req.params.featureId;
-      const state = stateManager.load();
+      const state = getState();
 
       if (!state) {
         res.status(404).json({
@@ -407,9 +421,6 @@ export async function startDashboardServer(
       res.setHeader("Connection", "keep-alive");
       res.setHeader("X-Accel-Buffering", "no");
       res.flushHeaders();
-
-      // Create WorkerManager to capture output
-      const workerManager = new WorkerManager(stateManager.projectDir, stateManager);
 
       // Send initial output
       const sendOutput = async () => {
@@ -459,7 +470,7 @@ export async function startDashboardServer(
       // Stream updates every 2 seconds
       const outputInterval = setInterval(async () => {
         // Check if feature still has active worker
-        const currentState = stateManager.load();
+        const currentState = getState();
         const currentFeature = currentState?.features.find((f) => f.id === featureId);
 
         if (!currentFeature || !currentFeature.workerId) {
@@ -489,7 +500,7 @@ export async function startDashboardServer(
   app.get(
     "/api/logs",
     asyncHandler(async (req: Request, res: Response) => {
-      const state = stateManager.load();
+      const state = getState();
 
       if (!state) {
         sendJson(res, {
@@ -539,7 +550,7 @@ export async function startDashboardServer(
   app.get(
     "/api/stats",
     asyncHandler(async (req: Request, res: Response) => {
-      const state = stateManager.load();
+      const state = getState();
 
       if (!state) {
         sendJson(res, {
@@ -634,7 +645,7 @@ export async function startDashboardServer(
     res.write(`event: connected\ndata: ${JSON.stringify({ clientId, timestamp: new Date().toISOString() })}\n\n`);
 
     // Send current state immediately
-    const state = stateManager.load();
+    const state = getState();
     if (state) {
       // Send full status
       res.write(`event: status\ndata: ${JSON.stringify({

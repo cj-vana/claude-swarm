@@ -86,7 +86,8 @@ async function ensureInitialized(projectDir: string): Promise<{ state: StateMana
     // Start dashboard server if enabled and not already running
     if (ENABLE_DASHBOARD && !dashboardServer) {
       try {
-        dashboardServer = await startDashboardServer(stateManager, {
+        // Pass a getter function so dashboard always has current stateManager
+        dashboardServer = await startDashboardServer(() => stateManager, {
           port: DASHBOARD_PORT,
           host: "127.0.0.1",
         });
