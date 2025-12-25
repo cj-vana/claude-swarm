@@ -28,6 +28,11 @@ import {
   getWorkerConfidence,
   AggregatedConfidence,
 } from "./confidence.js";
+import type { EnforcementIntegration, PreSpawnValidationResult, MonitoringResult } from "./enforcement-integration.js";
+
+// Re-export enforcement integration types and factory for convenience
+export type { EnforcementIntegration, PreSpawnValidationResult, MonitoringResult } from "./enforcement-integration.js";
+export { createEnforcementIntegration } from "./enforcement-integration.js";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -36,6 +41,8 @@ interface StartWorkerResult {
   success: boolean;
   sessionName?: string;
   error?: string;
+  // Enforcement validation info (when enforcement is enabled)
+  enforcementValidation?: PreSpawnValidationResult;
 }
 
 interface CheckWorkerResult {
@@ -52,6 +59,18 @@ export interface HeartbeatInfo {
   filesModified: string[];
   runningFor?: string;
   confidence?: AggregatedConfidence;
+  // Protocol enforcement info (when enforcement is enabled)
+  enforcement?: {
+    hasActiveProtocols: boolean;
+    alerts: Array<{
+      id: string;
+      type: string;
+      severity: string;
+      message: string;
+    }>;
+    iterationCount: number;
+    warningCount: number;
+  };
 }
 
 export type CompletionCallback = (
@@ -67,6 +86,8 @@ export class WorkerManager {
   private monitorInterval: NodeJS.Timeout | null = null;
   private completionCallbacks: CompletionCallback[] = [];
   private lastKnownStatus: Map<string, string> = new Map();
+  // Optional enforcement integration for protocol governance
+  private enforcement: EnforcementIntegration | null = null;
 
   constructor(projectDir: string, stateManager: StateManager) {
     this.projectDir = projectDir;
@@ -82,6 +103,21 @@ export class WorkerManager {
     if (!fs.existsSync(this.workerDir)) {
       fs.mkdirSync(this.workerDir, { recursive: true });
     }
+  }
+
+  /**
+   * Set the enforcement integration for protocol governance
+   * This is optional - if not set, no enforcement checks are performed
+   */
+  setEnforcement(enforcement: EnforcementIntegration): void {
+    this.enforcement = enforcement;
+  }
+
+  /**
+   * Get the enforcement integration (if set)
+   */
+  getEnforcement(): EnforcementIntegration | null {
+    return this.enforcement;
   }
 
   /**
@@ -390,6 +426,7 @@ echo 'PLANNER_EXITED' >> ${shellQuote(logFile)}
   /**
    * Start a worker in a tmux session
    * Security: Uses file-based prompt passing to avoid shell injection
+   * Enforcement: Validates against active protocols before spawning
    */
   async startWorker(
     feature: Feature,
@@ -403,6 +440,34 @@ echo 'PLANNER_EXITED' >> ${shellQuote(logFile)}
         success: false,
         error: `Invalid feature ID: ${error.message}`,
       };
+    }
+
+    // Pre-spawn validation: Check if active protocols allow this worker to spawn
+    let enforcementValidation: PreSpawnValidationResult | undefined;
+    if (this.enforcement) {
+      try {
+        enforcementValidation = this.enforcement.validatePreSpawn(feature, customPrompt);
+
+        // If enforcement blocks the spawn, return with validation details
+        if (!enforcementValidation.allowed) {
+          const violationMessages = enforcementValidation.violations
+            .map(v => `  - [${v.protocolName}] ${v.message}${v.remediation ? ` (${v.remediation})` : ""}`)
+            .join("\n");
+
+          return {
+            success: false,
+            error: `Protocol enforcement blocked worker spawn:\n${violationMessages}`,
+            enforcementValidation,
+          };
+        }
+      } catch (error) {
+        // Enforcement validation failed - fail-closed for security
+        console.error("Enforcement validation error:", error);
+        return {
+          success: false,
+          error: `Protocol enforcement validation failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
     }
 
     const sessionName = this.generateSessionName(feature.id);
@@ -462,9 +527,15 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
         })
       );
 
+      // Start enforcement monitoring for this worker if enforcement is enabled
+      if (this.enforcement) {
+        this.enforcement.startMonitoring(feature.id, sessionName);
+      }
+
       return {
         success: true,
         sessionName,
+        enforcementValidation,
       };
     } catch (error: any) {
       return {
@@ -472,6 +543,26 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
         error: sanitizeOutput(error.message),
       };
     }
+  }
+
+  /**
+   * Truncate a line to a maximum length, adding ellipsis if truncated
+   */
+  private truncateLine(line: string, maxLength: number = 120): string {
+    if (line.length <= maxLength) {
+      return line;
+    }
+    return line.substring(0, maxLength - 3) + "...";
+  }
+
+  /**
+   * Truncate all lines in output to a maximum length
+   */
+  private truncateOutputLines(output: string, maxLength: number = 120): string {
+    return output
+      .split("\n")
+      .map((line) => this.truncateLine(line, maxLength))
+      .join("\n");
   }
 
   /**
@@ -522,7 +613,7 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
           const summary = fs.readFileSync(doneFile, "utf-8");
           return {
             status: "completed",
-            output: `Worker completed.\n\nSummary:\n${sanitizeOutput(summary)}`,
+            output: `Worker completed.\n\nSummary:\n${this.truncateOutputLines(sanitizeOutput(summary))}`,
           };
         }
 
@@ -533,7 +624,7 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
           const lastLines = log.split("\n").slice(-lines).join("\n");
           return {
             status: "crashed",
-            output: `Worker session ended unexpectedly.\n\nLast output:\n${sanitizeOutput(lastLines)}`,
+            output: `Worker session ended unexpectedly.\n\nLast output:\n${this.truncateOutputLines(sanitizeOutput(lastLines))}`,
           };
         }
 
@@ -553,18 +644,25 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
         `-${Math.min(lines, 500)}`, // Limit lines to prevent abuse
       ]);
 
+      const featureId = this.extractFeatureId(sessionName);
+
       // If tmux capture is empty, try reading from log file as fallback
       if (!output || output.trim() === "") {
-        const featureId = this.extractFeatureId(sessionName);
         if (featureId) {
           const logFile = path.join(this.workerDir, `${featureId}.log`);
           if (fs.existsSync(logFile)) {
             const log = fs.readFileSync(logFile, "utf-8");
             if (log.length > 0) {
               const lastLines = log.split("\n").slice(-lines).join("\n");
+
+              // Record activity for enforcement monitoring
+              if (this.enforcement) {
+                this.enforcement.recordActivity(sessionName, featureId, lastLines);
+              }
+
               return {
                 status: "running",
-                output: `(from log file)\n${sanitizeOutput(lastLines)}`,
+                output: `(from log file)\n${this.truncateOutputLines(sanitizeOutput(lastLines))}`,
               };
             }
           }
@@ -577,9 +675,14 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
         };
       }
 
+      // Record activity for enforcement monitoring
+      if (this.enforcement && featureId) {
+        this.enforcement.recordActivity(sessionName, featureId, output);
+      }
+
       return {
         status: "running",
-        output: sanitizeOutput(output),
+        output: this.truncateOutputLines(sanitizeOutput(output)),
       };
     } catch (error: any) {
       return {
@@ -730,6 +833,39 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
       }
     }
 
+    // Get enforcement monitoring info if available
+    let enforcement: HeartbeatInfo["enforcement"] | undefined;
+    if (this.enforcement && basicResult.status === "running") {
+      const monitoringResult = this.enforcement.getMonitoringResult(sessionName);
+      enforcement = {
+        hasActiveProtocols: monitoringResult.hasActiveProtocols,
+        alerts: monitoringResult.alerts.map(a => ({
+          id: a.id,
+          type: a.type,
+          severity: a.severity,
+          message: a.message,
+        })),
+        iterationCount: monitoringResult.stats.iterationCount,
+        warningCount: monitoringResult.stats.warningCount,
+      };
+
+      // Check for any new alerts during this check
+      const newAlerts = this.enforcement.checkAlerts(sessionName);
+      if (newAlerts.length > 0) {
+        // Add any new alerts not already in the list
+        for (const alert of newAlerts) {
+          if (!enforcement.alerts.some(a => a.id === alert.id)) {
+            enforcement.alerts.push({
+              id: alert.id,
+              type: alert.type,
+              severity: alert.severity,
+              message: alert.message,
+            });
+          }
+        }
+      }
+    }
+
     return {
       status: basicResult.status,
       lastToolUsed,
@@ -739,6 +875,7 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
       filesModified: Array.from(filesModified).slice(0, 10), // Limit to 10 files
       runningFor,
       confidence,
+      enforcement,
     };
   }
 
@@ -805,6 +942,11 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
           (currentStatus.status === "completed" ||
             currentStatus.status === "crashed")
         ) {
+          // Stop enforcement monitoring for this worker
+          if (this.enforcement && feature.workerId) {
+            this.enforcement.stopMonitoring(feature.workerId);
+          }
+
           // Notify all registered callbacks
           for (const callback of this.completionCallbacks) {
             try {

@@ -32,6 +32,14 @@ import { startDashboardServer, DashboardServer } from "./dashboard/server.js";
 import { analyzeComplexity, formatComplexityResult } from "./utils/complexity-detector.js";
 import { evaluatePlans, parsePlanFromFile, formatEvaluationResult } from "./utils/plan-evaluator.js";
 import { getWorkerConfidence, formatConfidenceResult } from "./workers/confidence.js";
+import { ProtocolRegistry } from "./protocols/registry.js";
+import { Protocol, ProtocolSchema, validateProtocol } from "./protocols/schema.js";
+import { ContextEnricher, EnrichedContext, formatContextForPrompt } from "./context/enricher.js";
+import type { DocumentationRef, PreparedContext, ProtocolBinding, RoutingConfig } from "./state/manager.js";
+import { getNetworkingManager, ProtocolNetworkingManager, ConflictStrategy as NetworkConflictStrategy } from "./protocols/network/index.js";
+import { getProposalManager, ProposalManager, type ProtocolProposal } from "./protocols/proposal-manager.js";
+import { getBaseConstraints } from "./protocols/base-constraints.js";
+import type { BaseConstraints } from "./protocols/schema.js";
 
 // Dashboard configuration from environment variables
 const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT || "3456", 10);
@@ -49,18 +57,20 @@ const server = new McpServer({
 // State and worker managers (initialized per-project)
 let stateManager: StateManager | null = null;
 let workerManager: WorkerManager | null = null;
+let protocolRegistry: ProtocolRegistry | null = null;
 
 /**
  * Initialize managers for a project directory
  * Security: Validates project directory to prevent path traversal
  */
-async function ensureInitialized(projectDir: string): Promise<{ state: StateManager; workers: WorkerManager }> {
+async function ensureInitialized(projectDir: string): Promise<{ state: StateManager; workers: WorkerManager; protocols: ProtocolRegistry }> {
   // Validate project directory (throws on invalid path)
   const validatedDir = validateProjectDir(projectDir);
 
   if (!stateManager || stateManager.projectDir !== validatedDir) {
     stateManager = new StateManager(validatedDir);
     workerManager = new WorkerManager(validatedDir, stateManager);
+    protocolRegistry = new ProtocolRegistry(validatedDir);
 
     // Register completion callback to log when workers complete/crash
     workerManager.onWorkerCompletion((featureId, status, output) => {
@@ -104,7 +114,12 @@ async function ensureInitialized(projectDir: string): Promise<{ state: StateMana
     throw new Error("WorkerManager not initialized");
   }
 
-  return { state: stateManager, workers: workerManager };
+  // TypeScript safety: protocolRegistry is always set when stateManager is set
+  if (!protocolRegistry) {
+    throw new Error("ProtocolRegistry not initialized");
+  }
+
+  return { state: stateManager, workers: workerManager, protocols: protocolRegistry };
 }
 
 // ============================================================================
@@ -179,8 +194,9 @@ server.tool(
   "Get the current status of the orchestration session. Call this after context compaction to restore state, or anytime to check progress.",
   {
     projectDir: z.string().describe("Absolute path to the project directory"),
+    format: z.enum(["compact", "pretty"]).optional().describe("Output format: 'compact' for minimal output (no emoji/decorators), 'pretty' for full formatting (default)"),
   },
-  async ({ projectDir }) => {
+  async ({ projectDir, format = "pretty" }) => {
     const { state, workers } = await ensureInitialized(projectDir);
     const current = state.load();
 
@@ -205,6 +221,27 @@ server.tool(
 
     const elapsed = formatDuration(new Date(current.startTime), new Date());
 
+    // Compact format - minimal tokens, no emoji/decorators
+    if (format === "compact") {
+      let statusText = `Status: ${current.status} | Elapsed: ${elapsed}\n`;
+      statusText += `Features: ${completed.length} done, ${inProgress.length} active, ${pending.length} pending, ${failed.length} failed\n`;
+
+      if (inProgress.length > 0) {
+        statusText += `Active: ${inProgress.map(f => f.id).join(", ")}\n`;
+      }
+      if (pending.length > 0) {
+        statusText += `Next: ${pending.slice(0, 3).map(f => f.id).join(", ")}${pending.length > 3 ? ` +${pending.length - 3}` : ""}\n`;
+      }
+      if (failed.length > 0) {
+        statusText += `Failed: ${failed.map(f => f.id).join(", ")}\n`;
+      }
+
+      return {
+        content: [{ type: "text", text: statusText }],
+      };
+    }
+
+    // Pretty format - full formatting with emojis
     let statusText = `📊 Orchestration Status\n`;
     statusText += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
     statusText += `Project: ${current.projectDir}\n`;
@@ -761,8 +798,9 @@ server.tool(
     outputLines: z.number().optional().describe("Number of output lines per worker (default: 10)"),
     includeOutput: z.boolean().optional().describe("Include terminal output snippets (default: true)"),
     heartbeat: z.boolean().optional().describe("Use heartbeat mode for all workers (lightweight, no output)"),
+    format: z.enum(["compact", "pretty"]).optional().describe("Output format: 'compact' for minimal output (no emoji/decorators), 'pretty' for full formatting (default)"),
   },
-  async ({ projectDir, outputLines = 10, includeOutput = true, heartbeat = false }) => {
+  async ({ projectDir, outputLines = 10, includeOutput = true, heartbeat = false, format = "pretty" }) => {
     const { state, workers } = await ensureInitialized(projectDir);
     const current = state.load();
 
@@ -776,20 +814,48 @@ server.tool(
       (f) => f.status === "in_progress" && f.workerId
     );
 
+    const completedCount = current.features.filter((f) => f.status === "completed").length;
+    const pendingCount = current.features.filter((f) => f.status === "pending").length;
+    const failedCount = current.features.filter((f) => f.status === "failed").length;
+
     if (inProgressFeatures.length === 0) {
       const pending = current.features.filter((f) => f.status === "pending");
-      const completed = current.features.filter((f) => f.status === "completed");
-      const failed = current.features.filter((f) => f.status === "failed");
+      if (format === "compact") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No active workers | ${completedCount}/${current.features.length} done${failedCount > 0 ? `, ${failedCount} failed` : ""} | Next: ${pending.slice(0, 3).map((f) => f.id).join(", ") || "none"}`,
+            },
+          ],
+        };
+      }
       return {
         content: [
           {
             type: "text",
-            text: `📋 No workers currently running.\n\nProgress: ${completed.length}/${current.features.length} completed${failed.length > 0 ? `, ${failed.length} failed` : ""}\nPending: ${pending.length > 0 ? pending.map((f) => f.id).join(", ") : "none"}`,
+            text: `📋 No workers currently running.\n\nProgress: ${completedCount}/${current.features.length} completed${failedCount > 0 ? `, ${failedCount} failed` : ""}\nPending: ${pending.length > 0 ? pending.map((f) => f.id).join(", ") : "none"}`,
           },
         ],
       };
     }
 
+    // Compact format - minimal tokens, no emoji/decorators
+    if (format === "compact") {
+      let responseText = `Workers: ${inProgressFeatures.length} active | ${completedCount}/${current.features.length} done\n`;
+      for (const feature of inProgressFeatures) {
+        const info = await workers.getHeartbeatInfo(feature.workerId!, feature.startedAt);
+        responseText += `${feature.id}: ${info.status}`;
+        if (info.runningFor) responseText += ` ${info.runningFor}`;
+        if (info.lastToolUsed) responseText += ` [${info.lastToolUsed}]`;
+        responseText += `\n`;
+      }
+      return {
+        content: [{ type: "text", text: responseText }],
+      };
+    }
+
+    // Pretty format - full formatting with emojis
     let responseText = `📋 All Workers Status (${inProgressFeatures.length} active)\n`;
     responseText += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
 
@@ -838,14 +904,10 @@ server.tool(
     }
 
     // Summary section
-    const completed = current.features.filter((f) => f.status === "completed").length;
-    const pending = current.features.filter((f) => f.status === "pending").length;
-    const failed = current.features.filter((f) => f.status === "failed").length;
-
     responseText += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-    responseText += `📊 Progress: ${completed}/${current.features.length} completed`;
-    if (pending > 0) responseText += `, ${pending} pending`;
-    if (failed > 0) responseText += `, ${failed} failed`;
+    responseText += `📊 Progress: ${completedCount}/${current.features.length} completed`;
+    if (pendingCount > 0) responseText += `, ${pendingCount} pending`;
+    if (failedCount > 0) responseText += `, ${failedCount} failed`;
 
     return {
       content: [{ type: "text", text: responseText }],
@@ -1452,9 +1514,10 @@ server.tool(
   "Get the full progress log for the current session. Useful for understanding what has happened.",
   {
     projectDir: z.string().describe("Absolute path to the project directory"),
-    limit: z.number().optional().describe("Limit to last N entries (default: all)"),
+    limit: z.number().optional().describe("Number of entries to return (default: 20)"),
+    offset: z.number().optional().describe("Number of entries to skip from the end (default: 0)"),
   },
-  async ({ projectDir, limit }) => {
+  async ({ projectDir, limit = 20, offset = 0 }) => {
     const { state } = await ensureInitialized(projectDir);
     const current = state.load();
 
@@ -1464,13 +1527,20 @@ server.tool(
       };
     }
 
-    const logs = limit ? current.progressLog.slice(-limit) : current.progressLog;
+    const totalEntries = current.progressLog.length;
+    // Calculate slice range: skip 'offset' from end, then take 'limit' entries
+    const startIndex = Math.max(0, totalEntries - offset - limit);
+    const endIndex = Math.max(0, totalEntries - offset);
+    const logs = current.progressLog.slice(startIndex, endIndex);
+
+    const hasMore = startIndex > 0;
+    const nextOffset = offset + limit;
 
     return {
       content: [
         {
           type: "text",
-          text: `📜 Progress Log (${logs.length} entries)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n${logs.join("\n")}`,
+          text: `📜 Progress Log (${logs.length}/${totalEntries} entries)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n${logs.join("\n")}${hasMore ? `\n\n(${startIndex} older entries, use offset=${nextOffset} to see more)` : ""}`,
         },
       ],
     };
@@ -1485,8 +1555,9 @@ server.tool(
   "Get statistics about the current orchestration session including success rate, average completion time, worker counts, and attempt statistics.",
   {
     projectDir: z.string().describe("Absolute path to the project directory"),
+    format: z.enum(["compact", "pretty"]).optional().describe("Output format: 'compact' for minimal output (no emoji/decorators), 'pretty' for full formatting (default)"),
   },
-  async ({ projectDir }) => {
+  async ({ projectDir, format = "pretty" }) => {
     const { state, workers } = await ensureInitialized(projectDir);
     const current = state.load();
 
@@ -1536,7 +1607,21 @@ server.tool(
     const avgAttempts = calculateAverage(attemptCounts);
     const maxAttempts = attemptCounts.length > 0 ? Math.max(...attemptCounts) : 0;
 
-    // Build stats output
+    // Compact format - minimal tokens, no emoji/decorators
+    if (format === "compact") {
+      let statsText = `Elapsed: ${totalElapsed} | Success: ${formatPercent(successRate)}\n`;
+      statsText += `Features: ${completed.length} done, ${inProgress.length} active, ${pending.length} pending, ${failed.length} failed\n`;
+      statsText += `Workers: ${runningWorkers} running, ${completedWorkers} completed, ${crashedWorkers} crashed\n`;
+      statsText += `Attempts: ${totalAttempts} total, ${avgAttempts.toFixed(1)} avg, ${maxAttempts} max`;
+      if (completionTimes.length > 0) {
+        statsText += ` | Avg time: ${formatDurationMs(avgCompletionTimeMs)}`;
+      }
+      return {
+        content: [{ type: "text", text: statsText }],
+      };
+    }
+
+    // Pretty format - full formatting with emojis
     let statsText = `📈 Session Statistics\n`;
     statsText += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
 
@@ -2215,6 +2300,2573 @@ server.tool(
     };
   }
 );
+
+// ============================================================================
+// TOOL: protocol_register
+// ============================================================================
+server.tool(
+  "protocol_register",
+  "Register a new protocol for behavioral governance. Protocols define constraints and enforcement rules for worker behavior.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    protocol: z.object({
+      id: z.string().regex(/^[a-zA-Z0-9_-]+$/).describe("Unique protocol ID (alphanumeric with dashes/underscores)"),
+      version: z.string().regex(/^\d+\.\d+\.\d+$/).describe("Semantic version (e.g., '1.0.0')"),
+      name: z.string().min(1).max(100).describe("Human-readable name"),
+      description: z.string().max(1000).optional().describe("Protocol description"),
+      extends: z.array(z.string()).optional().describe("IDs of protocols this extends"),
+      requires: z.array(z.string()).optional().describe("IDs of required protocols"),
+      conflicts: z.array(z.string()).optional().describe("IDs of conflicting protocols"),
+      constraints: z.array(z.object({
+        id: z.string().describe("Constraint ID"),
+        type: z.enum(["tool_restriction", "file_access", "output_format", "behavioral", "temporal", "resource", "side_effect"]),
+        rule: z.record(z.unknown()).describe("Constraint-specific rule configuration"),
+        severity: z.enum(["error", "warning", "info"]),
+        message: z.string().max(500).describe("Human-readable description"),
+        enabled: z.boolean().optional(),
+      })).describe("Array of constraints"),
+      enforcement: z.object({
+        mode: z.enum(["strict", "permissive", "audit", "learning"]).optional(),
+        preExecutionValidation: z.boolean().optional(),
+        postExecutionValidation: z.boolean().optional(),
+        onViolation: z.enum(["block", "warn", "log", "notify", "rollback"]).optional(),
+        logLevel: z.enum(["none", "minimal", "standard", "verbose", "debug"]).optional(),
+      }).optional().describe("Enforcement configuration"),
+      applicableContexts: z.object({
+        featurePatterns: z.array(z.string()).optional(),
+        filePatterns: z.array(z.string()).optional(),
+        projectPatterns: z.array(z.string()).optional(),
+        taskPatterns: z.array(z.string()).optional(),
+        environments: z.array(z.string()).optional(),
+      }).optional().describe("Context matching configuration"),
+      priority: z.number().int().min(0).max(1000).optional().describe("Priority (higher = more important, default: 100)"),
+      tags: z.array(z.string()).optional().describe("Tags for categorization"),
+    }).describe("Protocol definition"),
+    activate: z.boolean().optional().describe("Activate immediately after registration (default: false)"),
+  },
+  async ({ projectDir, protocol, activate = false }) => {
+    const { protocols, state } = await ensureInitialized(projectDir);
+
+    try {
+      // Build full protocol with defaults
+      const fullProtocol: Protocol = {
+        id: protocol.id,
+        version: protocol.version,
+        name: protocol.name,
+        description: protocol.description,
+        extends: protocol.extends,
+        requires: protocol.requires,
+        conflicts: protocol.conflicts,
+        constraints: protocol.constraints.map(c => ({
+          ...c,
+          enabled: c.enabled ?? true,
+          rule: c.rule as any, // Trust the Zod validation
+        })),
+        enforcement: {
+          mode: protocol.enforcement?.mode ?? "strict",
+          preExecutionValidation: protocol.enforcement?.preExecutionValidation ?? true,
+          postExecutionValidation: protocol.enforcement?.postExecutionValidation ?? true,
+          onViolation: protocol.enforcement?.onViolation ?? "block",
+          maxRetries: 0,
+          retryDelaySeconds: 0,
+          logLevel: protocol.enforcement?.logLevel ?? "standard",
+          includeContext: true,
+          allowOverride: false,
+          overrideRequiresApproval: true,
+        },
+        applicableContexts: protocol.applicableContexts ?? {},
+        priority: protocol.priority ?? 100,
+        tags: protocol.tags,
+        enabled: true,
+        deprecated: false,
+        createdAt: new Date().toISOString(),
+      };
+
+      // Validate and register
+      validateProtocol(fullProtocol);
+      protocols.register(fullProtocol, "orchestrator");
+
+      // Optionally activate
+      if (activate) {
+        protocols.activate(fullProtocol.id, "orchestrator");
+      }
+
+      // Log to state
+      const current = state.load();
+      if (current) {
+        current.progressLog.push(
+          `[${new Date().toISOString()}] 📋 Protocol registered: ${fullProtocol.id} v${fullProtocol.version}${activate ? " (activated)" : ""}`
+        );
+        state.save(current);
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `✅ Protocol Registered\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nID: ${fullProtocol.id}\nVersion: ${fullProtocol.version}\nName: ${fullProtocol.name}\nConstraints: ${fullProtocol.constraints.length}\nPriority: ${fullProtocol.priority}\nStatus: ${activate ? "Active" : "Registered (inactive)"}\n\n${activate ? "Protocol is now enforcing constraints." : "Use protocol_activate to enable enforcement."}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `❌ Failed to register protocol: ${error.message}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+// ============================================================================
+// TOOL: protocol_activate
+// ============================================================================
+server.tool(
+  "protocol_activate",
+  "Activate a registered protocol to begin enforcing its constraints. Checks for conflicts with currently active protocols.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    protocolId: z.string().describe("ID of the protocol to activate"),
+  },
+  async ({ projectDir, protocolId }) => {
+    const { protocols, state } = await ensureInitialized(projectDir);
+
+    try {
+      // Get the protocol first to include details in response
+      const protocol = protocols.getProtocol(protocolId);
+      if (!protocol) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `❌ Protocol '${protocolId}' not found.\n\nUse protocol_list to see available protocols.`,
+            },
+          ],
+        };
+      }
+
+      // Check if already active
+      if (protocols.isActive(protocolId)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `⚠️ Protocol '${protocolId}' is already active.`,
+            },
+          ],
+        };
+      }
+
+      // Activate
+      protocols.activate(protocolId, "orchestrator");
+
+      // Log to state
+      const current = state.load();
+      if (current) {
+        current.progressLog.push(
+          `[${new Date().toISOString()}] ▶️ Protocol activated: ${protocolId}`
+        );
+        state.save(current);
+      }
+
+      const activeCount = protocols.getActive().length;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `▶️ Protocol Activated\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nID: ${protocol.id}\nName: ${protocol.name}\nVersion: ${protocol.version}\nConstraints: ${protocol.constraints.length}\nMode: ${protocol.enforcement.mode}\n\nTotal active protocols: ${activeCount}\n\nThe protocol is now enforcing its constraints on workers.`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `❌ Failed to activate protocol: ${error.message}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+// ============================================================================
+// TOOL: protocol_deactivate
+// ============================================================================
+server.tool(
+  "protocol_deactivate",
+  "Deactivate an active protocol to stop enforcing its constraints. Checks for dependencies from other active protocols.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    protocolId: z.string().describe("ID of the protocol to deactivate"),
+  },
+  async ({ projectDir, protocolId }) => {
+    const { protocols, state } = await ensureInitialized(projectDir);
+
+    try {
+      // Get the protocol first to include details in response
+      const protocol = protocols.getProtocol(protocolId);
+      if (!protocol) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `❌ Protocol '${protocolId}' not found.\n\nUse protocol_list to see available protocols.`,
+            },
+          ],
+        };
+      }
+
+      // Check if already inactive
+      if (!protocols.isActive(protocolId)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `⚠️ Protocol '${protocolId}' is already inactive.`,
+            },
+          ],
+        };
+      }
+
+      // Deactivate
+      protocols.deactivate(protocolId, "orchestrator");
+
+      // Log to state
+      const current = state.load();
+      if (current) {
+        current.progressLog.push(
+          `[${new Date().toISOString()}] ⏸️ Protocol deactivated: ${protocolId}`
+        );
+        state.save(current);
+      }
+
+      const activeCount = protocols.getActive().length;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `⏸️ Protocol Deactivated\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nID: ${protocol.id}\nName: ${protocol.name}\n\nTotal active protocols: ${activeCount}\n\nThe protocol's constraints are no longer being enforced.`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `❌ Failed to deactivate protocol: ${error.message}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+// ============================================================================
+// TOOL: protocol_list
+// ============================================================================
+server.tool(
+  "protocol_list",
+  "List all registered protocols with their status and summary information.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    activeOnly: z.boolean().optional().describe("Only show active protocols (default: false)"),
+    format: z.enum(["compact", "pretty"]).optional().describe("Output format: 'compact' for minimal output, 'pretty' for full formatting (default)"),
+  },
+  async ({ projectDir, activeOnly = false, format = "pretty" }) => {
+    const { protocols } = await ensureInitialized(projectDir);
+
+    const allProtocols = activeOnly ? protocols.getActiveProtocols() : protocols.getAllProtocols();
+    const activeIds = new Set(protocols.getActive());
+
+    if (allProtocols.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: activeOnly
+              ? "No active protocols.\n\nUse protocol_register to add protocols, then protocol_activate to enable them."
+              : "No protocols registered.\n\nUse protocol_register to add behavioral governance protocols.",
+          },
+        ],
+      };
+    }
+
+    // Sort by priority (highest first), then by ID
+    const sorted = [...allProtocols].sort((a, b) => {
+      if (b.priority !== a.priority) return b.priority - a.priority;
+      return a.id.localeCompare(b.id);
+    });
+
+    if (format === "compact") {
+      let text = `Protocols: ${sorted.length} total, ${activeIds.size} active\n`;
+      for (const p of sorted) {
+        const status = activeIds.has(p.id) ? "ON" : "OFF";
+        text += `[${status}] ${p.id} v${p.version} (${p.constraints.length} constraints)\n`;
+      }
+      return { content: [{ type: "text", text }] };
+    }
+
+    // Pretty format
+    let text = `📋 Protocol Registry\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    text += `Total: ${sorted.length} | Active: ${activeIds.size}\n\n`;
+
+    for (const p of sorted) {
+      const statusIcon = activeIds.has(p.id) ? "🟢" : "⚪";
+      const statusText = activeIds.has(p.id) ? "Active" : "Inactive";
+
+      text += `${statusIcon} ${p.id} (${statusText})\n`;
+      text += `   Name: ${p.name}\n`;
+      text += `   Version: ${p.version}\n`;
+      text += `   Priority: ${p.priority}\n`;
+      text += `   Constraints: ${p.constraints.length}\n`;
+      text += `   Mode: ${p.enforcement.mode}\n`;
+      if (p.description) {
+        text += `   Description: ${p.description.slice(0, 80)}${p.description.length > 80 ? "..." : ""}\n`;
+      }
+      if (p.extends && p.extends.length > 0) {
+        text += `   Extends: ${p.extends.join(", ")}\n`;
+      }
+      if (p.requires && p.requires.length > 0) {
+        text += `   Requires: ${p.requires.join(", ")}\n`;
+      }
+      if (p.tags && p.tags.length > 0) {
+        text += `   Tags: ${p.tags.join(", ")}\n`;
+      }
+      text += `\n`;
+    }
+
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// ============================================================================
+// TOOL: protocol_status
+// ============================================================================
+server.tool(
+  "protocol_status",
+  "Get detailed status of a specific protocol including its constraints, enforcement config, violations, and audit history.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    protocolId: z.string().describe("ID of the protocol to inspect"),
+    includeViolations: z.boolean().optional().describe("Include recent violations (default: true)"),
+    includeAudit: z.boolean().optional().describe("Include audit log entries (default: false)"),
+    violationLimit: z.number().int().min(1).max(50).optional().describe("Max violations to show (default: 10)"),
+    auditLimit: z.number().int().min(1).max(50).optional().describe("Max audit entries to show (default: 10)"),
+  },
+  async ({ projectDir, protocolId, includeViolations = true, includeAudit = false, violationLimit = 10, auditLimit = 10 }) => {
+    const { protocols } = await ensureInitialized(projectDir);
+
+    const protocol = protocols.getProtocol(protocolId);
+    if (!protocol) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `❌ Protocol '${protocolId}' not found.\n\nUse protocol_list to see available protocols.`,
+          },
+        ],
+      };
+    }
+
+    const isActive = protocols.isActive(protocolId);
+    const stats = protocols.getStats();
+
+    let text = `📊 Protocol Status: ${protocol.id}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    // Basic info
+    text += `📌 Basic Information\n`;
+    text += `   ID: ${protocol.id}\n`;
+    text += `   Name: ${protocol.name}\n`;
+    text += `   Version: ${protocol.version}\n`;
+    text += `   Status: ${isActive ? "🟢 Active" : "⚪ Inactive"}\n`;
+    text += `   Priority: ${protocol.priority}\n`;
+    if (protocol.description) {
+      text += `   Description: ${protocol.description}\n`;
+    }
+    if (protocol.createdAt) {
+      text += `   Created: ${protocol.createdAt}\n`;
+    }
+    if (protocol.updatedAt) {
+      text += `   Updated: ${protocol.updatedAt}\n`;
+    }
+    if (protocol.deprecated) {
+      text += `   ⚠️ DEPRECATED: ${protocol.deprecationMessage || "No reason provided"}\n`;
+    }
+    text += `\n`;
+
+    // Dependencies
+    if ((protocol.extends && protocol.extends.length > 0) ||
+        (protocol.requires && protocol.requires.length > 0) ||
+        (protocol.conflicts && protocol.conflicts.length > 0)) {
+      text += `🔗 Dependencies\n`;
+      if (protocol.extends && protocol.extends.length > 0) {
+        text += `   Extends: ${protocol.extends.join(", ")}\n`;
+      }
+      if (protocol.requires && protocol.requires.length > 0) {
+        text += `   Requires: ${protocol.requires.join(", ")}\n`;
+      }
+      if (protocol.conflicts && protocol.conflicts.length > 0) {
+        text += `   Conflicts: ${protocol.conflicts.join(", ")}\n`;
+      }
+      text += `\n`;
+    }
+
+    // Enforcement config
+    text += `⚙️ Enforcement Configuration\n`;
+    text += `   Mode: ${protocol.enforcement.mode}\n`;
+    text += `   Pre-validation: ${protocol.enforcement.preExecutionValidation ? "Yes" : "No"}\n`;
+    text += `   Post-validation: ${protocol.enforcement.postExecutionValidation ? "Yes" : "No"}\n`;
+    text += `   On Violation: ${protocol.enforcement.onViolation}\n`;
+    text += `   Log Level: ${protocol.enforcement.logLevel}\n`;
+    if (protocol.enforcement.allowOverride) {
+      text += `   Override Allowed: Yes (requires approval: ${protocol.enforcement.overrideRequiresApproval})\n`;
+    }
+    text += `\n`;
+
+    // Constraints
+    text += `📏 Constraints (${protocol.constraints.length})\n`;
+    for (const c of protocol.constraints) {
+      const enabledIcon = c.enabled ? "✓" : "✗";
+      const severityIcon = c.severity === "error" ? "🔴" : c.severity === "warning" ? "🟡" : "🔵";
+      text += `   ${enabledIcon} ${severityIcon} [${c.type}] ${c.id}\n`;
+      text += `      ${c.message}\n`;
+    }
+    text += `\n`;
+
+    // Context matching
+    const ctx = protocol.applicableContexts;
+    const hasContexts = ctx.featurePatterns?.length || ctx.filePatterns?.length ||
+                        ctx.projectPatterns?.length || ctx.taskPatterns?.length ||
+                        ctx.environments?.length;
+    if (hasContexts) {
+      text += `🎯 Context Matching\n`;
+      if (ctx.featurePatterns?.length) text += `   Features: ${ctx.featurePatterns.join(", ")}\n`;
+      if (ctx.filePatterns?.length) text += `   Files: ${ctx.filePatterns.join(", ")}\n`;
+      if (ctx.projectPatterns?.length) text += `   Projects: ${ctx.projectPatterns.join(", ")}\n`;
+      if (ctx.taskPatterns?.length) text += `   Tasks: ${ctx.taskPatterns.join(", ")}\n`;
+      if (ctx.environments?.length) text += `   Environments: ${ctx.environments.join(", ")}\n`;
+      text += `\n`;
+    }
+
+    // Violations
+    if (includeViolations) {
+      const violations = protocols.getViolations({ protocolId, limit: violationLimit });
+      text += `⚠️ Recent Violations (${violations.length})\n`;
+      if (violations.length === 0) {
+        text += `   No violations recorded\n`;
+      } else {
+        for (const v of violations) {
+          const resolvedIcon = v.resolved ? "✅" : "❌";
+          text += `   ${resolvedIcon} [${v.severity}] ${v.constraintId} - ${v.message.slice(0, 60)}${v.message.length > 60 ? "..." : ""}\n`;
+          text += `      Time: ${v.timestamp}${v.featureId ? ` | Feature: ${v.featureId}` : ""}\n`;
+        }
+      }
+      text += `\n`;
+    }
+
+    // Audit log
+    if (includeAudit) {
+      const auditEntries = protocols.getAuditLog({ protocolId, limit: auditLimit });
+      text += `📜 Audit Log (${auditEntries.length})\n`;
+      if (auditEntries.length === 0) {
+        text += `   No audit entries\n`;
+      } else {
+        for (const e of auditEntries) {
+          text += `   [${e.action}] ${e.timestamp}${e.actor ? ` by ${e.actor}` : ""}\n`;
+        }
+      }
+      text += `\n`;
+    }
+
+    // Registry stats
+    text += `📈 Registry Stats\n`;
+    text += `   Total Protocols: ${stats.totalProtocols}\n`;
+    text += `   Active Protocols: ${stats.activeProtocols}\n`;
+    text += `   Total Violations: ${stats.totalViolations}\n`;
+    text += `   Unresolved Violations: ${stats.unresolvedViolations}\n`;
+
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// ============================================================================
+// TOOL: enrich_feature
+// ============================================================================
+server.tool(
+  "enrich_feature",
+  "Auto-enrich a feature with relevant documentation and code context. Uses intelligent analysis to find related files, detect patterns, and prepare context for workers.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    featureId: z.string().describe("ID of the feature to enrich"),
+    maxDocLength: z.number().optional().describe("Maximum characters per documentation file (default: 4000)"),
+    maxCodeLength: z.number().optional().describe("Maximum characters per code file (default: 2000)"),
+    maxTotalContext: z.number().optional().describe("Maximum total context size (default: 16000)"),
+    maxRelatedFiles: z.number().optional().describe("Maximum number of related files to include (default: 10)"),
+    detectPatterns: z.boolean().optional().describe("Enable architectural pattern detection (default: true)"),
+  },
+  async ({ projectDir, featureId, maxDocLength, maxCodeLength, maxTotalContext, maxRelatedFiles, detectPatterns }) => {
+    const { state } = await ensureInitialized(projectDir);
+
+    // Validate feature ID
+    try {
+      validateFeatureId(featureId);
+    } catch (error: any) {
+      return {
+        content: [{ type: "text", text: `Invalid feature ID: ${error.message}` }],
+      };
+    }
+
+    const current = state.load();
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active session. Use orchestrator_init first." }],
+      };
+    }
+
+    const feature = current.features.find((f) => f.id === featureId);
+    if (!feature) {
+      return {
+        content: [{ type: "text", text: `Feature '${featureId}' not found.` }],
+      };
+    }
+
+    // Create enricher with custom config
+    const enricher = new ContextEnricher(projectDir, {
+      maxDocLength: maxDocLength ?? 4000,
+      maxCodeLength: maxCodeLength ?? 2000,
+      maxTotalContext: maxTotalContext ?? 16000,
+      maxRelatedFiles: maxRelatedFiles ?? 10,
+      detectPatterns: detectPatterns ?? true,
+    });
+
+    // Enrich the feature
+    const enrichedContext = await enricher.enrichFeature(feature, current.features);
+
+    // Convert to feature context format
+    const documentation: DocumentationRef[] = enrichedContext.documentation.map((doc) => ({
+      type: "file" as const,
+      path: doc.path,
+      title: doc.path,
+      relevance: `Priority ${doc.priority}${doc.truncated ? " (truncated)" : ""}`,
+    }));
+
+    const prepared: PreparedContext[] = [];
+
+    // Add project info as prepared context
+    if (enrichedContext.projectInfo.type !== "unknown") {
+      prepared.push({
+        key: "project_info",
+        content: `Type: ${enrichedContext.projectInfo.type}${enrichedContext.projectInfo.framework ? `, Framework: ${enrichedContext.projectInfo.framework}` : ""}${enrichedContext.projectInfo.testFramework ? `, Tests: ${enrichedContext.projectInfo.testFramework}` : ""}`,
+        source: "auto-detected",
+        priority: "required",
+      });
+    }
+
+    // Add documentation as prepared context
+    for (const doc of enrichedContext.documentation.slice(0, 3)) {
+      prepared.push({
+        key: `doc_${doc.path.replace(/[^a-zA-Z0-9]/g, "_")}`,
+        content: doc.content,
+        source: doc.path,
+        priority: doc.priority >= 80 ? "required" : "recommended",
+        tokenEstimate: Math.ceil(doc.content.length / 4),
+      });
+    }
+
+    // Add pattern conventions as prepared context
+    for (const pattern of enrichedContext.patterns) {
+      prepared.push({
+        key: `pattern_${pattern.name.toLowerCase().replace(/\s+/g, "_")}`,
+        content: `${pattern.name}: ${pattern.description}\nConventions:\n${pattern.conventions.map((c) => `- ${c}`).join("\n")}`,
+        source: "pattern-detection",
+        priority: "recommended",
+      });
+    }
+
+    // Store context in feature
+    feature.context = {
+      documentation,
+      prepared,
+    };
+
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 📚 Enriched ${featureId}: ${documentation.length} docs, ${enrichedContext.relatedFiles.length} related files, ${enrichedContext.patterns.length} patterns`
+    );
+    state.save(current);
+    state.writeProgressFile();
+
+    // Build response
+    let response = `📚 Feature Enriched: ${featureId}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    response += `📁 Project: ${enrichedContext.projectInfo.type}`;
+    if (enrichedContext.projectInfo.framework) {
+      response += ` (${enrichedContext.projectInfo.framework})`;
+    }
+    response += `\n\n`;
+
+    response += `📄 Documentation (${documentation.length}):\n`;
+    for (const doc of documentation.slice(0, 5)) {
+      response += `  - ${doc.path}${doc.relevance ? ` [${doc.relevance}]` : ""}\n`;
+    }
+    if (documentation.length > 5) {
+      response += `  ... and ${documentation.length - 5} more\n`;
+    }
+    response += `\n`;
+
+    response += `📂 Related Files (${enrichedContext.relatedFiles.length}):\n`;
+    for (const file of enrichedContext.relatedFiles.slice(0, 5)) {
+      response += `  - ${file.path} (score: ${file.relevanceScore})\n`;
+      response += `    ${file.relevanceReason}\n`;
+    }
+    if (enrichedContext.relatedFiles.length > 5) {
+      response += `  ... and ${enrichedContext.relatedFiles.length - 5} more\n`;
+    }
+    response += `\n`;
+
+    if (enrichedContext.patterns.length > 0) {
+      response += `🏗️ Detected Patterns:\n`;
+      for (const pattern of enrichedContext.patterns) {
+        response += `  - ${pattern.name}: ${pattern.description}\n`;
+      }
+      response += `\n`;
+    }
+
+    if (enrichedContext.relatedFeatures.length > 0) {
+      response += `🔗 Related Features: ${enrichedContext.relatedFeatures.join(", ")}\n\n`;
+    }
+
+    response += `📊 Total Context: ${enrichedContext.totalSize} chars (~${Math.ceil(enrichedContext.totalSize / 4)} tokens)\n`;
+    response += `\nContext has been stored in the feature. It will be automatically injected into worker prompts.`;
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: set_feature_context
+// ============================================================================
+server.tool(
+  "set_feature_context",
+  "Manually set context for a feature. Allows adding documentation references, prepared context blocks, and protocol bindings.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    featureId: z.string().describe("ID of the feature to configure"),
+    documentation: z.array(z.object({
+      type: z.enum(["file", "url", "snippet"]).describe("Type of documentation reference"),
+      path: z.string().describe("File path, URL, or identifier"),
+      title: z.string().optional().describe("Human-readable title"),
+      relevance: z.string().optional().describe("Why this doc is relevant"),
+      section: z.string().optional().describe("Specific section within the document"),
+    })).optional().describe("Documentation references to add"),
+    prepared: z.array(z.object({
+      key: z.string().describe("Unique identifier for this context block"),
+      content: z.string().describe("The actual context content"),
+      source: z.string().optional().describe("Where this context came from"),
+      priority: z.enum(["required", "recommended", "optional"]).describe("Priority for inclusion"),
+      tokenEstimate: z.number().optional().describe("Estimated token count"),
+    })).optional().describe("Pre-processed context blocks"),
+    protocolBindings: z.array(z.object({
+      protocolId: z.string().describe("Reference to the protocol in the registry"),
+      version: z.string().optional().describe("Optional version constraint"),
+      scope: z.enum(["pre_execution", "post_execution", "continuous", "all"]).describe("When to apply the protocol"),
+      priority: z.number().describe("Higher priority protocols are enforced first"),
+      parameters: z.record(z.unknown()).optional().describe("Protocol-specific parameters"),
+      overrides: z.record(z.unknown()).optional().describe("Override default protocol settings"),
+    })).optional().describe("Protocol bindings to apply"),
+    merge: z.boolean().optional().describe("Merge with existing context instead of replacing (default: true)"),
+  },
+  async ({ projectDir, featureId, documentation, prepared, protocolBindings, merge = true }) => {
+    const { state, protocols } = await ensureInitialized(projectDir);
+
+    // Validate feature ID
+    try {
+      validateFeatureId(featureId);
+    } catch (error: any) {
+      return {
+        content: [{ type: "text", text: `Invalid feature ID: ${error.message}` }],
+      };
+    }
+
+    const current = state.load();
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active session. Use orchestrator_init first." }],
+      };
+    }
+
+    const feature = current.features.find((f) => f.id === featureId);
+    if (!feature) {
+      return {
+        content: [{ type: "text", text: `Feature '${featureId}' not found.` }],
+      };
+    }
+
+    // Validate protocol bindings if provided
+    if (protocolBindings) {
+      for (const binding of protocolBindings) {
+        const protocol = protocols.getProtocol(binding.protocolId);
+        if (!protocol) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `❌ Protocol '${binding.protocolId}' not found. Register it first using protocol_register.`,
+              },
+            ],
+          };
+        }
+      }
+    }
+
+    // Initialize or merge context
+    if (!feature.context || !merge) {
+      feature.context = {
+        documentation: [],
+        prepared: [],
+      };
+    }
+
+    // Add documentation
+    if (documentation) {
+      const existingPaths = new Set(feature.context.documentation.map((d) => d.path));
+      for (const doc of documentation) {
+        if (!existingPaths.has(doc.path)) {
+          feature.context.documentation.push(doc as DocumentationRef);
+          existingPaths.add(doc.path);
+        }
+      }
+    }
+
+    // Add prepared context
+    if (prepared) {
+      const existingKeys = new Set(feature.context.prepared.map((p) => p.key));
+      for (const prep of prepared) {
+        if (existingKeys.has(prep.key)) {
+          // Update existing
+          const idx = feature.context.prepared.findIndex((p) => p.key === prep.key);
+          if (idx >= 0) {
+            feature.context.prepared[idx] = prep as PreparedContext;
+          }
+        } else {
+          feature.context.prepared.push(prep as PreparedContext);
+          existingKeys.add(prep.key);
+        }
+      }
+    }
+
+    // Set protocol bindings
+    if (protocolBindings) {
+      if (merge && feature.protocolBindings) {
+        // Merge by protocol ID
+        const existingIds = new Set(feature.protocolBindings.map((b) => b.protocolId));
+        for (const binding of protocolBindings) {
+          if (existingIds.has(binding.protocolId)) {
+            // Update existing
+            const idx = feature.protocolBindings.findIndex((b) => b.protocolId === binding.protocolId);
+            if (idx >= 0) {
+              feature.protocolBindings[idx] = binding as ProtocolBinding;
+            }
+          } else {
+            feature.protocolBindings.push(binding as ProtocolBinding);
+          }
+        }
+      } else {
+        feature.protocolBindings = protocolBindings as ProtocolBinding[];
+      }
+    }
+
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 📝 Set context for ${featureId}: ${feature.context.documentation.length} docs, ${feature.context.prepared.length} prepared, ${feature.protocolBindings?.length || 0} protocols`
+    );
+    state.save(current);
+    state.writeProgressFile();
+
+    // Build response
+    let response = `📝 Feature Context Updated: ${featureId}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    response += `📄 Documentation (${feature.context.documentation.length}):\n`;
+    for (const doc of feature.context.documentation.slice(0, 5)) {
+      response += `  - [${doc.type}] ${doc.path}${doc.title ? ` - ${doc.title}` : ""}\n`;
+    }
+    if (feature.context.documentation.length > 5) {
+      response += `  ... and ${feature.context.documentation.length - 5} more\n`;
+    }
+    response += `\n`;
+
+    response += `📦 Prepared Context (${feature.context.prepared.length}):\n`;
+    for (const prep of feature.context.prepared.slice(0, 5)) {
+      response += `  - [${prep.priority}] ${prep.key}`;
+      if (prep.tokenEstimate) {
+        response += ` (~${prep.tokenEstimate} tokens)`;
+      }
+      response += `\n`;
+    }
+    if (feature.context.prepared.length > 5) {
+      response += `  ... and ${feature.context.prepared.length - 5} more\n`;
+    }
+    response += `\n`;
+
+    if (feature.protocolBindings && feature.protocolBindings.length > 0) {
+      response += `📋 Protocol Bindings (${feature.protocolBindings.length}):\n`;
+      for (const binding of feature.protocolBindings) {
+        response += `  - ${binding.protocolId} [${binding.scope}] priority=${binding.priority}\n`;
+      }
+      response += `\n`;
+    }
+
+    response += `Mode: ${merge ? "Merged with existing context" : "Replaced existing context"}`;
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: get_feature_graph
+// ============================================================================
+server.tool(
+  "get_feature_graph",
+  "Get the feature dependency graph with context information. Shows relationships between features, their dependencies, and enriched context summaries.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    format: z.enum(["compact", "pretty", "json"]).optional().describe("Output format (default: pretty)"),
+    includeContext: z.boolean().optional().describe("Include context summaries (default: true)"),
+    includeProtocols: z.boolean().optional().describe("Include protocol bindings (default: true)"),
+  },
+  async ({ projectDir, format = "pretty", includeContext = true, includeProtocols = true }) => {
+    const { state } = await ensureInitialized(projectDir);
+
+    const current = state.load();
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active session. Use orchestrator_init first." }],
+      };
+    }
+
+    // Build dependency graph
+    interface GraphNode {
+      id: string;
+      description: string;
+      status: string;
+      dependsOn: string[];
+      dependedBy: string[];
+      hasContext: boolean;
+      contextSummary?: {
+        docs: number;
+        prepared: number;
+        protocols: number;
+        totalTokens: number;
+      };
+      routing?: RoutingConfig;
+    }
+
+    const nodes: Map<string, GraphNode> = new Map();
+
+    // First pass: create nodes
+    for (const feature of current.features) {
+      const node: GraphNode = {
+        id: feature.id,
+        description: feature.description,
+        status: feature.status,
+        dependsOn: feature.dependsOn || [],
+        dependedBy: [],
+        hasContext: !!(feature.context && (feature.context.documentation.length > 0 || feature.context.prepared.length > 0)),
+        routing: feature.routing,
+      };
+
+      if (includeContext && feature.context) {
+        let totalTokens = 0;
+        for (const prep of feature.context.prepared) {
+          totalTokens += prep.tokenEstimate || Math.ceil(prep.content.length / 4);
+        }
+        node.contextSummary = {
+          docs: feature.context.documentation.length,
+          prepared: feature.context.prepared.length,
+          protocols: feature.protocolBindings?.length || 0,
+          totalTokens,
+        };
+      }
+
+      nodes.set(feature.id, node);
+    }
+
+    // Second pass: compute dependedBy
+    for (const feature of current.features) {
+      if (feature.dependsOn) {
+        for (const depId of feature.dependsOn) {
+          const depNode = nodes.get(depId);
+          if (depNode) {
+            depNode.dependedBy.push(feature.id);
+          }
+        }
+      }
+    }
+
+    // Find root nodes (no dependencies)
+    const roots = Array.from(nodes.values()).filter((n) => n.dependsOn.length === 0);
+
+    // Find leaf nodes (nothing depends on them)
+    const leaves = Array.from(nodes.values()).filter((n) => n.dependedBy.length === 0);
+
+    // JSON format
+    if (format === "json") {
+      const graphData = {
+        projectDir: current.projectDir,
+        featureCount: current.features.length,
+        roots: roots.map((n) => n.id),
+        leaves: leaves.map((n) => n.id),
+        nodes: Object.fromEntries(nodes),
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(graphData, null, 2) }],
+      };
+    }
+
+    // Compact format
+    if (format === "compact") {
+      let text = `Features: ${nodes.size} | Roots: ${roots.length} | Leaves: ${leaves.length}\n`;
+
+      // Sort by status then by dependency order
+      const sorted = Array.from(nodes.values()).sort((a, b) => {
+        const statusOrder: Record<string, number> = { in_progress: 0, pending: 1, completed: 2, failed: 3 };
+        const aOrder = statusOrder[a.status] ?? 4;
+        const bOrder = statusOrder[b.status] ?? 4;
+        if (aOrder !== bOrder) return aOrder - bOrder;
+        return a.dependsOn.length - b.dependsOn.length;
+      });
+
+      for (const node of sorted) {
+        const statusIcon = node.status === "completed" ? "+" : node.status === "failed" ? "x" : node.status === "in_progress" ? ">" : "-";
+        const contextIcon = node.hasContext ? "C" : " ";
+        const deps = node.dependsOn.length > 0 ? ` <-[${node.dependsOn.join(",")}]` : "";
+        text += `[${statusIcon}${contextIcon}] ${node.id}${deps}\n`;
+      }
+      return {
+        content: [{ type: "text", text }],
+      };
+    }
+
+    // Pretty format
+    let text = `🔗 Feature Dependency Graph\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    text += `📊 Summary\n`;
+    text += `   Total Features: ${nodes.size}\n`;
+    text += `   Root Features (no deps): ${roots.length}\n`;
+    text += `   Leaf Features (no dependents): ${leaves.length}\n\n`;
+
+    // Group by status
+    const byStatus: Record<string, GraphNode[]> = {
+      in_progress: [],
+      pending: [],
+      completed: [],
+      failed: [],
+    };
+    for (const node of nodes.values()) {
+      if (byStatus[node.status]) {
+        byStatus[node.status].push(node);
+      }
+    }
+
+    for (const [status, statusNodes] of Object.entries(byStatus)) {
+      if (statusNodes.length === 0) continue;
+
+      const statusIcon = status === "completed" ? "✅" : status === "failed" ? "❌" : status === "in_progress" ? "🔄" : "⏳";
+      text += `${statusIcon} ${status.toUpperCase()} (${statusNodes.length})\n`;
+
+      for (const node of statusNodes) {
+        text += `   ${node.id}: ${node.description.slice(0, 50)}${node.description.length > 50 ? "..." : ""}\n`;
+
+        if (node.dependsOn.length > 0) {
+          text += `      ← Depends on: ${node.dependsOn.join(", ")}\n`;
+        }
+        if (node.dependedBy.length > 0) {
+          text += `      → Depended by: ${node.dependedBy.join(", ")}\n`;
+        }
+
+        if (includeContext && node.contextSummary) {
+          text += `      📚 Context: ${node.contextSummary.docs} docs, ${node.contextSummary.prepared} prepared (~${node.contextSummary.totalTokens} tokens)`;
+          if (node.contextSummary.protocols > 0) {
+            text += `, ${node.contextSummary.protocols} protocols`;
+          }
+          text += `\n`;
+        }
+
+        if (includeProtocols && node.routing) {
+          const r = node.routing;
+          const parts: string[] = [];
+          if (r.preferredWorkerType) parts.push(`type=${r.preferredWorkerType}`);
+          if (r.maxParallelism) parts.push(`parallel=${r.maxParallelism}`);
+          if (r.isolationLevel) parts.push(`isolation=${r.isolationLevel}`);
+          if (parts.length > 0) {
+            text += `      🛤️ Routing: ${parts.join(", ")}\n`;
+          }
+        }
+      }
+      text += `\n`;
+    }
+
+    // Show critical path (longest dependency chain)
+    function getDepth(nodeId: string, visited: Set<string> = new Set()): number {
+      if (visited.has(nodeId)) return 0; // Cycle detection
+      visited.add(nodeId);
+      const node = nodes.get(nodeId);
+      if (!node || node.dependsOn.length === 0) return 1;
+      let maxDepth = 0;
+      for (const depId of node.dependsOn) {
+        maxDepth = Math.max(maxDepth, getDepth(depId, new Set(visited)));
+      }
+      return maxDepth + 1;
+    }
+
+    let maxDepth = 0;
+    let deepestNode: GraphNode | null = null;
+    for (const node of nodes.values()) {
+      const depth = getDepth(node.id);
+      if (depth > maxDepth) {
+        maxDepth = depth;
+        deepestNode = node;
+      }
+    }
+
+    if (deepestNode && maxDepth > 1) {
+      text += `📏 Longest Dependency Chain: ${maxDepth} features\n`;
+      text += `   Deepest: ${deepestNode.id}\n`;
+    }
+
+    return {
+      content: [{ type: "text", text }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: route_feature
+// ============================================================================
+server.tool(
+  "route_feature",
+  "Configure routing for a feature. Sets preferences for worker type, capabilities, parallelism, and isolation level.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    featureId: z.string().describe("ID of the feature to configure routing for"),
+    preferredWorkerType: z.string().optional().describe("Hint for worker specialization (e.g., 'frontend', 'backend', 'testing')"),
+    requiredCapabilities: z.array(z.string()).optional().describe("Capabilities the worker must have"),
+    excludeCapabilities: z.array(z.string()).optional().describe("Capabilities to avoid"),
+    maxParallelism: z.number().int().min(1).max(10).optional().describe("Maximum concurrent workers for this feature"),
+    affinityGroup: z.string().optional().describe("Group features that should run on the same worker"),
+    isolationLevel: z.enum(["none", "session", "process", "container"]).optional().describe("Isolation level for the worker"),
+  },
+  async ({ projectDir, featureId, preferredWorkerType, requiredCapabilities, excludeCapabilities, maxParallelism, affinityGroup, isolationLevel }) => {
+    const { state } = await ensureInitialized(projectDir);
+
+    // Validate feature ID
+    try {
+      validateFeatureId(featureId);
+    } catch (error: any) {
+      return {
+        content: [{ type: "text", text: `Invalid feature ID: ${error.message}` }],
+      };
+    }
+
+    const current = state.load();
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active session. Use orchestrator_init first." }],
+      };
+    }
+
+    const feature = current.features.find((f) => f.id === featureId);
+    if (!feature) {
+      return {
+        content: [{ type: "text", text: `Feature '${featureId}' not found.` }],
+      };
+    }
+
+    // Build routing config
+    const routing: RoutingConfig = {
+      ...(feature.routing || {}),
+    };
+
+    if (preferredWorkerType !== undefined) {
+      routing.preferredWorkerType = preferredWorkerType;
+    }
+    if (requiredCapabilities !== undefined) {
+      routing.requiredCapabilities = requiredCapabilities;
+    }
+    if (excludeCapabilities !== undefined) {
+      routing.excludeCapabilities = excludeCapabilities;
+    }
+    if (maxParallelism !== undefined) {
+      routing.maxParallelism = maxParallelism;
+    }
+    if (affinityGroup !== undefined) {
+      routing.affinityGroup = affinityGroup;
+    }
+    if (isolationLevel !== undefined) {
+      routing.isolationLevel = isolationLevel;
+    }
+
+    feature.routing = routing;
+
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 🛤️ Configured routing for ${featureId}${preferredWorkerType ? ` (type=${preferredWorkerType})` : ""}${isolationLevel ? ` (isolation=${isolationLevel})` : ""}`
+    );
+    state.save(current);
+    state.writeProgressFile();
+
+    // Build response
+    let response = `🛤️ Feature Routing Configured: ${featureId}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    response += `Feature: ${feature.description.slice(0, 60)}${feature.description.length > 60 ? "..." : ""}\n\n`;
+
+    response += `📋 Routing Configuration:\n`;
+    if (routing.preferredWorkerType) {
+      response += `   Preferred Type: ${routing.preferredWorkerType}\n`;
+    }
+    if (routing.requiredCapabilities && routing.requiredCapabilities.length > 0) {
+      response += `   Required Capabilities: ${routing.requiredCapabilities.join(", ")}\n`;
+    }
+    if (routing.excludeCapabilities && routing.excludeCapabilities.length > 0) {
+      response += `   Excluded Capabilities: ${routing.excludeCapabilities.join(", ")}\n`;
+    }
+    if (routing.maxParallelism) {
+      response += `   Max Parallelism: ${routing.maxParallelism}\n`;
+    }
+    if (routing.affinityGroup) {
+      response += `   Affinity Group: ${routing.affinityGroup}\n`;
+    }
+    if (routing.isolationLevel) {
+      response += `   Isolation Level: ${routing.isolationLevel}\n`;
+    }
+
+    // Find other features in same affinity group
+    if (routing.affinityGroup) {
+      const sameGroup = current.features.filter(
+        (f) => f.id !== featureId && f.routing?.affinityGroup === routing.affinityGroup
+      );
+      if (sameGroup.length > 0) {
+        response += `\n🔗 Features in same affinity group '${routing.affinityGroup}':\n`;
+        for (const f of sameGroup) {
+          response += `   - ${f.id}\n`;
+        }
+      }
+    }
+
+    response += `\nRouting will be applied when starting workers for this feature.`;
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: export_protocols
+// ============================================================================
+server.tool(
+  "export_protocols",
+  "Export protocols to a shareable bundle. Creates a portable bundle that can be imported by other MCP instances or shared with team members.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    protocolIds: z.array(z.string()).optional().describe("Specific protocol IDs to export (empty = all active)"),
+    includeDependencies: z.boolean().optional().describe("Include all dependencies of selected protocols (default: true)"),
+    includeInactive: z.boolean().optional().describe("Include inactive protocols (default: false)"),
+    filterTags: z.array(z.string()).optional().describe("Only include protocols with these tags"),
+    name: z.string().optional().describe("Bundle name (auto-generated if not provided)"),
+    description: z.string().optional().describe("Bundle description"),
+    signBundle: z.boolean().optional().describe("Sign the bundle for integrity verification (default: true)"),
+    outputPath: z.string().optional().describe("File path to save the bundle (optional)"),
+  },
+  async ({ projectDir, protocolIds, includeDependencies, includeInactive, filterTags, name, description, signBundle, outputPath }) => {
+    const { protocols } = await ensureInitialized(projectDir);
+    const networking = getNetworkingManager(projectDir, protocols);
+
+    const result = networking.exportProtocols({
+      protocolIds,
+      includeDependencies,
+      includeInactive,
+      filterTags,
+      name,
+      description,
+      signBundle,
+      outputPath,
+    });
+
+    if (!result.success) {
+      return {
+        content: [{ type: "text", text: `❌ Export failed: ${result.error}` }],
+      };
+    }
+
+    const bundle = result.bundle!;
+    let response = `📦 Protocols Exported\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    response += `Bundle ID: ${bundle.bundleId}\n`;
+    response += `Name: ${bundle.name}\n`;
+    response += `Version: ${bundle.version}\n`;
+    response += `Source Instance: ${bundle.source.instanceId}\n`;
+    response += `Exported At: ${bundle.source.exportedAt}\n\n`;
+
+    response += `📋 Protocols (${bundle.protocols.length}):\n`;
+    for (const p of bundle.protocols.slice(0, 10)) {
+      const activeIcon = protocols.isActive(p.id) ? "▶️" : "⏸️";
+      response += `  ${activeIcon} ${p.id} v${p.version} - ${p.name}\n`;
+    }
+    if (bundle.protocols.length > 10) {
+      response += `  ... and ${bundle.protocols.length - 10} more\n`;
+    }
+
+    response += `\n🔗 Registration Order:\n`;
+    response += `  ${bundle.registrationOrder.join(" → ")}\n`;
+
+    if (bundle.signature) {
+      response += `\n🔐 Signed: Yes (${bundle.signature.algorithm})\n`;
+    }
+
+    if (result.outputPath) {
+      response += `\n📁 Saved to: ${result.outputPath}\n`;
+    } else {
+      response += `\n💡 Use 'outputPath' parameter to save to a file, or use the bundle directly with import_protocols.\n`;
+    }
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: import_protocols
+// ============================================================================
+server.tool(
+  "import_protocols",
+  "Import protocols from a bundle file or inline bundle. Supports conflict resolution strategies and dry-run mode.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    bundlePath: z.string().optional().describe("Path to bundle file to import"),
+    bundle: z.object({
+      bundleId: z.string(),
+      name: z.string(),
+      version: z.string(),
+      source: z.object({
+        instanceId: z.string(),
+        exportedAt: z.string(),
+      }),
+      protocols: z.array(z.object({
+        id: z.string(),
+        version: z.string(),
+        name: z.string(),
+      }).passthrough()),
+      registrationOrder: z.array(z.string()),
+    }).passthrough().optional().describe("Inline bundle object to import"),
+    conflictStrategy: z.enum(["skip", "replace", "rename", "merge", "newest", "highest_priority"]).optional()
+      .describe("How to handle conflicts (default: skip)"),
+    activateImported: z.boolean().optional().describe("Activate imported protocols immediately (default: false)"),
+    validateDependencies: z.boolean().optional().describe("Validate dependencies exist (default: true)"),
+    verifySignature: z.boolean().optional().describe("Verify bundle signature if present (default: true)"),
+    dryRun: z.boolean().optional().describe("Validate but don't actually import (default: false)"),
+  },
+  async ({ projectDir, bundlePath, bundle, conflictStrategy, activateImported, validateDependencies, verifySignature, dryRun }) => {
+    const { protocols, state } = await ensureInitialized(projectDir);
+    const networking = getNetworkingManager(projectDir, protocols);
+
+    const result = networking.importProtocols({
+      bundle: bundle as any,
+      bundlePath,
+      conflictStrategy: conflictStrategy as NetworkConflictStrategy | undefined,
+      activateImported,
+      validateDependencies,
+      verifySignature,
+      dryRun,
+      actor: "import_protocols",
+    });
+
+    let response: string;
+
+    if (result.dryRun) {
+      response = `🔍 Import Dry Run\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    } else if (result.success) {
+      response = `✅ Protocols Imported\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    } else {
+      response = `⚠️ Import Completed with Issues\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    }
+
+    if (result.imported.length > 0) {
+      response += `📥 Imported (${result.imported.length}):\n`;
+      for (const id of result.imported.slice(0, 10)) {
+        response += `  ✓ ${id}\n`;
+      }
+      if (result.imported.length > 10) {
+        response += `  ... and ${result.imported.length - 10} more\n`;
+      }
+      response += `\n`;
+    }
+
+    if (result.activated.length > 0) {
+      response += `▶️ Activated (${result.activated.length}):\n`;
+      for (const id of result.activated) {
+        response += `  ✓ ${id}\n`;
+      }
+      response += `\n`;
+    }
+
+    if (result.skipped.length > 0) {
+      response += `⏭️ Skipped (${result.skipped.length}):\n`;
+      for (const id of result.skipped.slice(0, 5)) {
+        response += `  - ${id}\n`;
+      }
+      if (result.skipped.length > 5) {
+        response += `  ... and ${result.skipped.length - 5} more\n`;
+      }
+      response += `\n`;
+    }
+
+    if (result.conflicts.length > 0) {
+      response += `⚔️ Conflicts (${result.conflicts.length}):\n`;
+      for (const c of result.conflicts.slice(0, 5)) {
+        response += `  - ${c.protocolId}: ${c.resolution || "unresolved"}\n`;
+        response += `    Local: v${c.existingVersion} | Imported: v${c.importedVersion}\n`;
+      }
+      if (result.conflicts.length > 5) {
+        response += `  ... and ${result.conflicts.length - 5} more\n`;
+      }
+      response += `\n`;
+    }
+
+    if (result.errors.length > 0) {
+      response += `❌ Errors:\n`;
+      for (const err of result.errors) {
+        response += `  - ${err}\n`;
+      }
+      response += `\n`;
+    }
+
+    // Log to state
+    if (!result.dryRun && result.imported.length > 0) {
+      const current = state.load();
+      if (current) {
+        current.progressLog.push(
+          `[${new Date().toISOString()}] 📥 Imported ${result.imported.length} protocols${result.activated.length > 0 ? `, activated ${result.activated.length}` : ""}`
+        );
+        state.save(current);
+      }
+    }
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: discover_protocols
+// ============================================================================
+server.tool(
+  "discover_protocols",
+  "Discover peer MCP instances and their protocols. Enables cross-instance protocol sharing.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    startSync: z.boolean().optional().describe("Start synchronization service (default: false)"),
+    refreshPeers: z.boolean().optional().describe("Refresh the list of known peers (default: true)"),
+  },
+  async ({ projectDir, startSync, refreshPeers }) => {
+    const { protocols } = await ensureInitialized(projectDir);
+    const networking = getNetworkingManager(projectDir, protocols);
+
+    const result = networking.discoverProtocols({
+      startSync,
+      refreshPeers: refreshPeers ?? true,
+    });
+
+    if (!result.success) {
+      return {
+        content: [{ type: "text", text: `❌ Discovery failed: ${result.error}` }],
+      };
+    }
+
+    let response = `🔍 Protocol Discovery\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    response += `🆔 This Instance: ${result.instanceId.slice(0, 16)}...\n`;
+    response += `🔄 Sync Status: ${result.syncStarted ? "Started" : "Not running"}\n\n`;
+
+    if (result.peers.length === 0) {
+      response += `👥 No peer instances discovered.\n\n`;
+      response += `Peers are discovered through shared state files.\n`;
+      response += `To enable peer discovery:\n`;
+      response += `  1. Start another MCP instance on the same project\n`;
+      response += `  2. Use sync_protocols to broadcast your protocols\n`;
+    } else {
+      response += `👥 Discovered Peers (${result.peers.length}):\n`;
+      for (const peer of result.peers) {
+        response += `  📡 ${peer.name || peer.instanceId.slice(0, 16)}\n`;
+        response += `     ID: ${peer.instanceId}\n`;
+        response += `     Protocols: ${peer.protocolCount}\n`;
+        response += `     Last Seen: ${peer.lastSeen}\n`;
+        if (peer.capabilities && peer.capabilities.length > 0) {
+          response += `     Capabilities: ${peer.capabilities.join(", ")}\n`;
+        }
+        response += `\n`;
+      }
+    }
+
+    if (!result.syncStarted) {
+      response += `\n💡 Use startSync: true to enable real-time protocol synchronization.`;
+    }
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: sync_protocols
+// ============================================================================
+server.tool(
+  "sync_protocols",
+  "Synchronize protocols with peer MCP instances. Supports push, pull, or bidirectional sync.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    targetInstance: z.string().optional().describe("Specific instance ID to sync with (omit for broadcast)"),
+    direction: z.enum(["push", "pull", "bidirectional"]).optional().describe("Sync direction (default: bidirectional)"),
+    protocolIds: z.array(z.string()).optional().describe("Specific protocols to sync (default: all active)"),
+    includeInactive: z.boolean().optional().describe("Include inactive protocols in push (default: false)"),
+    conflictStrategy: z.enum(["skip", "replace", "rename", "merge", "newest", "highest_priority"]).optional()
+      .describe("How to handle conflicts on pull (default: skip)"),
+  },
+  async ({ projectDir, targetInstance, direction, protocolIds, includeInactive, conflictStrategy }) => {
+    const { protocols, state } = await ensureInitialized(projectDir);
+    const networking = getNetworkingManager(projectDir, protocols);
+
+    const result = networking.syncProtocols({
+      targetInstance,
+      direction,
+      protocolIds,
+      includeInactive,
+      conflictStrategy: conflictStrategy as NetworkConflictStrategy | undefined,
+    });
+
+    if (!result.success) {
+      return {
+        content: [{ type: "text", text: `❌ Sync failed: ${result.error}` }],
+      };
+    }
+
+    let response = `🔄 Protocol Sync Complete\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    response += `Direction: ${direction || "bidirectional"}\n`;
+    if (targetInstance) {
+      response += `Target: ${targetInstance}\n`;
+    } else {
+      response += `Target: All peers (broadcast)\n`;
+    }
+    response += `\n`;
+
+    response += `📤 Pushed: ${result.pushed} protocol${result.pushed !== 1 ? "s" : ""}\n`;
+    response += `📥 Pulled: ${result.pulled} protocol${result.pulled !== 1 ? "s" : ""}\n`;
+
+    if (result.conflicts > 0) {
+      response += `⚔️ Conflicts: ${result.conflicts}\n`;
+    }
+
+    // Get networking stats
+    const stats = networking.getStats();
+    response += `\n📊 Networking Stats:\n`;
+    response += `   Known Peers: ${stats.peerCount}\n`;
+    response += `   Exported Bundles: ${stats.exportedBundles}\n`;
+    if (stats.lastSync) {
+      response += `   Last Sync: ${stats.lastSync}\n`;
+    }
+
+    // Log to state
+    const current = state.load();
+    if (current) {
+      current.progressLog.push(
+        `[${new Date().toISOString()}] 🔄 Protocol sync: pushed ${result.pushed}, pulled ${result.pulled}${result.conflicts > 0 ? `, ${result.conflicts} conflicts` : ""}`
+      );
+      state.save(current);
+    }
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: propose_protocol
+// ============================================================================
+server.tool(
+  "propose_protocol",
+  "Submit a new protocol proposal for review. Validates against base constraints and calculates risk score. LLMs and users can submit proposals which must be approved before becoming active.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    protocol: z.object({
+      id: z.string().regex(/^[a-zA-Z0-9_-]+$/).describe("Unique protocol ID (alphanumeric with dashes/underscores)"),
+      version: z.string().regex(/^\d+\.\d+\.\d+$/).describe("Semantic version (e.g., '1.0.0')"),
+      name: z.string().min(1).max(100).describe("Human-readable name"),
+      description: z.string().max(1000).optional().describe("Protocol description"),
+      constraints: z.array(z.object({
+        id: z.string().describe("Constraint ID"),
+        type: z.enum(["tool_restriction", "file_access", "output_format", "behavioral", "temporal", "resource", "side_effect"])
+          .describe("Constraint type"),
+        rule: z.record(z.any()).describe("Constraint-specific rule configuration"),
+        severity: z.enum(["error", "warning", "info"]).describe("Severity level"),
+        message: z.string().max(500).describe("Human-readable description"),
+        enabled: z.boolean().optional().describe("Whether constraint is enabled (default: true)"),
+      })).describe("Array of constraints"),
+      enforcement: z.object({
+        mode: z.enum(["strict", "permissive", "audit", "learning"]).optional().describe("Enforcement mode (default: strict)"),
+        onViolation: z.enum(["block", "warn", "log", "notify", "rollback"]).optional().describe("Action on violation (default: block)"),
+        preExecutionValidation: z.boolean().optional().describe("Validate before execution (default: true)"),
+        postExecutionValidation: z.boolean().optional().describe("Validate after execution (default: true)"),
+        logLevel: z.enum(["none", "minimal", "standard", "verbose", "debug"]).optional().describe("Logging level (default: standard)"),
+        allowOverride: z.boolean().optional().describe("Allow constraint overrides (default: false)"),
+        overrideRequiresApproval: z.boolean().optional().describe("Require approval for overrides (default: true)"),
+      }).optional().describe("Enforcement configuration"),
+      priority: z.number().min(0).max(1000).optional().describe("Priority (higher = more important, default: 100)"),
+      tags: z.array(z.string()).optional().describe("Tags for categorization"),
+      requires: z.array(z.string()).optional().describe("IDs of required protocols"),
+      extends: z.array(z.string()).optional().describe("IDs of protocols this extends"),
+      conflicts: z.array(z.string()).optional().describe("IDs of conflicting protocols"),
+      applicableContexts: z.object({
+        featurePatterns: z.array(z.string()).optional(),
+        filePatterns: z.array(z.string()).optional(),
+        taskPatterns: z.array(z.string()).optional(),
+        projectPatterns: z.array(z.string()).optional(),
+        environments: z.array(z.string()).optional(),
+      }).optional().describe("Context matching configuration"),
+    }).describe("The protocol to propose"),
+    description: z.string().optional().describe("Why this protocol is needed"),
+    rationale: z.string().optional().describe("Design rationale and decisions"),
+    source: z.enum(["llm", "user", "system", "import"]).optional().describe("Source of the proposal (default: llm)"),
+    priority: z.number().min(0).max(100).optional().describe("Review priority (0-100, default: 50)"),
+    tags: z.array(z.string()).optional().describe("Tags for the proposal"),
+  },
+  async ({ projectDir, protocol, description, rationale, source, priority, tags }) => {
+    await ensureInitialized(projectDir);
+    const proposalManager = getProposalManager(projectDir);
+
+    try {
+      // Build the full protocol with defaults
+      const fullProtocol: Protocol = {
+        id: protocol.id,
+        version: protocol.version,
+        name: protocol.name,
+        description: protocol.description,
+        constraints: protocol.constraints.map((c) => ({
+          id: c.id,
+          type: c.type,
+          rule: { type: c.type, ...c.rule },
+          severity: c.severity,
+          message: c.message,
+          enabled: c.enabled ?? true,
+        })),
+        enforcement: {
+          mode: protocol.enforcement?.mode ?? "strict",
+          onViolation: protocol.enforcement?.onViolation ?? "block",
+          preExecutionValidation: protocol.enforcement?.preExecutionValidation ?? true,
+          postExecutionValidation: protocol.enforcement?.postExecutionValidation ?? true,
+          logLevel: protocol.enforcement?.logLevel ?? "standard",
+          allowOverride: protocol.enforcement?.allowOverride ?? false,
+          overrideRequiresApproval: protocol.enforcement?.overrideRequiresApproval ?? true,
+          maxRetries: 0,
+          retryDelaySeconds: 0,
+          includeContext: true,
+        },
+        priority: protocol.priority ?? 100,
+        tags: protocol.tags,
+        requires: protocol.requires,
+        extends: protocol.extends,
+        conflicts: protocol.conflicts,
+        applicableContexts: {
+          featurePatterns: protocol.applicableContexts?.featurePatterns,
+          filePatterns: protocol.applicableContexts?.filePatterns,
+          taskPatterns: protocol.applicableContexts?.taskPatterns,
+          projectPatterns: protocol.applicableContexts?.projectPatterns,
+          environments: protocol.applicableContexts?.environments,
+        },
+        createdAt: new Date().toISOString(),
+        enabled: true,
+        deprecated: false,
+      };
+
+      // Submit the proposal
+      const proposal = proposalManager.submit({
+        protocol: fullProtocol,
+        source: source ?? "llm",
+        description,
+        rationale,
+        priority,
+        tags,
+        submittedBy: source ?? "llm",
+      });
+
+      // Format response
+      let response = `📋 Protocol Proposal Submitted\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+      response += `📝 Proposal ID: ${proposal.id}\n`;
+      response += `🏷️ Protocol: ${proposal.protocol.name} (${proposal.protocol.id} v${proposal.protocol.version})\n`;
+      response += `📊 Status: ${proposal.status}\n`;
+      response += `⏰ Submitted: ${proposal.submittedAt}\n`;
+      if (proposal.expiresAt) {
+        response += `⏳ Expires: ${proposal.expiresAt}\n`;
+      }
+      response += `\n`;
+
+      // Validation summary
+      const validation = proposal.validation;
+      response += `🔍 Validation Results:\n`;
+      response += `   Valid: ${validation.isValid ? "✅ Yes" : "❌ No"}\n`;
+      response += `   Fixable: ${validation.isFixable ? "✅ Yes" : "❌ No"}\n`;
+      response += `   Issues: ${validation.issues.length} (${validation.issues.filter((i: { type: string }) => i.type === "error").length} errors, ${validation.issues.filter((i: { type: string }) => i.type === "warning").length} warnings)\n`;
+      response += `\n`;
+
+      // Risk assessment
+      const risk = validation.riskAssessment;
+      response += `⚠️ Risk Assessment:\n`;
+      response += `   Score: ${risk.overallScore}/100\n`;
+      response += `   Level: ${risk.riskLevel.toUpperCase()}\n`;
+      response += `   Acceptable: ${risk.isAcceptable ? "✅ Yes" : "❌ No"} (threshold: ${risk.acceptanceThreshold})\n`;
+
+      if (risk.highestRisks.length > 0) {
+        response += `   Highest Risks:\n`;
+        for (const r of risk.highestRisks.slice(0, 3)) {
+          response += `     • ${r}\n`;
+        }
+      }
+
+      if (risk.recommendations.length > 0) {
+        response += `   Recommendations:\n`;
+        for (const rec of risk.recommendations.slice(0, 3)) {
+          response += `     • ${rec}\n`;
+        }
+      }
+
+      // If not valid, show errors
+      if (!validation.isValid) {
+        response += `\n❌ Validation Errors:\n`;
+        for (const issue of validation.issues.filter((i: { type: string }) => i.type === "error").slice(0, 5)) {
+          response += `   • ${issue.message}`;
+          if (issue.suggestedFix) {
+            response += ` (Fix: ${issue.suggestedFix})`;
+          }
+          response += `\n`;
+        }
+      }
+
+      response += `\n💡 Next Steps:\n`;
+      if (validation.isValid) {
+        response += `   Use approve_protocol to approve and register this protocol.\n`;
+      } else if (validation.isFixable) {
+        response += `   The protocol has issues but can be fixed. Review the errors and resubmit.\n`;
+      } else {
+        response += `   The protocol has unfixable issues. Review the base constraints with get_base_constraints.\n`;
+      }
+      response += `   Use reject_protocol to reject this proposal.\n`;
+      response += `   Use review_proposals to see all pending proposals.\n`;
+
+      return {
+        content: [{ type: "text", text: response }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `❌ Error submitting proposal: ${error instanceof Error ? error.message : String(error)}` }],
+      };
+    }
+  }
+);
+
+// ============================================================================
+// TOOL: review_proposals
+// ============================================================================
+server.tool(
+  "review_proposals",
+  "Review pending protocol proposals. Shows validation results, risk scores, and recommendations.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    status: z.enum(["pending", "reviewing", "approved", "rejected", "expired"]).optional()
+      .describe("Filter by status (default: pending)"),
+    source: z.enum(["llm", "user", "system", "import"]).optional().describe("Filter by source"),
+    proposalId: z.string().optional().describe("Get details for a specific proposal"),
+    limit: z.number().min(1).max(50).optional().describe("Maximum proposals to return (default: 10)"),
+    includeStats: z.boolean().optional().describe("Include proposal statistics (default: true)"),
+  },
+  async ({ projectDir, status, source, proposalId, limit, includeStats }) => {
+    await ensureInitialized(projectDir);
+    const proposalManager = getProposalManager(projectDir);
+
+    try {
+      // If a specific proposal is requested
+      if (proposalId) {
+        const proposal = proposalManager.getProposal(proposalId);
+        if (!proposal) {
+          return {
+            content: [{ type: "text", text: `❌ Proposal '${proposalId}' not found` }],
+          };
+        }
+
+        let response = `📋 Proposal Details: ${proposalId}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+        response += formatProposalDetails(proposal);
+        return {
+          content: [{ type: "text", text: response }],
+        };
+      }
+
+      // Get proposals with filters
+      const proposals = proposalManager.getProposals({
+        status: status ?? "pending",
+        source,
+        limit: limit ?? 10,
+      });
+
+      let response = `📋 Protocol Proposals\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+      // Show stats if requested
+      if (includeStats !== false) {
+        const stats = proposalManager.getStats();
+        response += `📊 Statistics:\n`;
+        response += `   Total: ${stats.total} | Pending: ${stats.pending} | Approved: ${stats.approved} | Rejected: ${stats.rejected}\n`;
+        response += `   Avg Risk Score: ${stats.avgRiskScore}/100 | Valid Proposals: ${stats.validProposals}\n`;
+        response += `   By Source: LLM(${stats.bySource.llm}) User(${stats.bySource.user}) System(${stats.bySource.system}) Import(${stats.bySource.import})\n\n`;
+      }
+
+      if (proposals.length === 0) {
+        response += `No ${status ?? "pending"} proposals found.\n`;
+        response += `\n💡 Use propose_protocol to submit a new protocol proposal.\n`;
+      } else {
+        response += `Found ${proposals.length} ${status ?? "pending"} proposal(s):\n\n`;
+
+        for (const proposal of proposals) {
+          response += `┌─────────────────────────────────────\n`;
+          response += `│ 📝 ${proposal.id}\n`;
+          response += `│ Protocol: ${proposal.protocol.name} (${proposal.protocol.id} v${proposal.protocol.version})\n`;
+          response += `│ Source: ${proposal.source} | Priority: ${proposal.priority}\n`;
+          response += `│ Valid: ${proposal.validation.isValid ? "✅" : "❌"} | Risk: ${proposal.validation.riskAssessment.overallScore}/100 (${proposal.validation.riskAssessment.riskLevel})\n`;
+          if (proposal.description) {
+            response += `│ Description: ${proposal.description.slice(0, 60)}${proposal.description.length > 60 ? "..." : ""}\n`;
+          }
+          response += `│ Submitted: ${proposal.submittedAt}\n`;
+          response += `└─────────────────────────────────────\n\n`;
+        }
+
+        response += `💡 Commands:\n`;
+        response += `   • review_proposals with proposalId for details\n`;
+        response += `   • approve_protocol to approve a proposal\n`;
+        response += `   • reject_protocol to reject a proposal\n`;
+      }
+
+      return {
+        content: [{ type: "text", text: response }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `❌ Error reviewing proposals: ${error instanceof Error ? error.message : String(error)}` }],
+      };
+    }
+  }
+);
+
+// ============================================================================
+// TOOL: approve_protocol
+// ============================================================================
+server.tool(
+  "approve_protocol",
+  "Approve a pending protocol proposal and register it in the protocol registry.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    proposalId: z.string().describe("ID of the proposal to approve"),
+    reason: z.string().describe("Reason for approval"),
+    reviewedBy: z.string().optional().describe("Who is approving (default: orchestrator)"),
+    modifications: z.record(z.any()).optional().describe("Optional modifications to apply to the protocol before registration"),
+    activate: z.boolean().optional().describe("Activate the protocol immediately after registration (default: false)"),
+  },
+  async ({ projectDir, proposalId, reason, reviewedBy, modifications, activate }) => {
+    const { protocols, state } = await ensureInitialized(projectDir);
+    const proposalManager = getProposalManager(projectDir);
+
+    try {
+      // Approve the proposal
+      const proposal = proposalManager.approve({
+        proposalId,
+        decision: "approve",
+        reason,
+        reviewedBy: reviewedBy ?? "orchestrator",
+        modifications: modifications as Partial<Protocol> | undefined,
+      });
+
+      let response = `✅ Protocol Approved\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+      response += `📝 Proposal: ${proposalId}\n`;
+      response += `🏷️ Protocol: ${proposal.protocol.name} (${proposal.protocol.id} v${proposal.protocol.version})\n`;
+      response += `👤 Approved By: ${proposal.reviewedBy}\n`;
+      response += `📅 Approved At: ${proposal.reviewedAt}\n`;
+      response += `📋 Reason: ${reason}\n\n`;
+
+      // Optionally activate
+      if (activate) {
+        try {
+          protocols.activate(proposal.protocol.id, reviewedBy ?? "orchestrator");
+          response += `⚡ Protocol has been activated!\n`;
+        } catch (error) {
+          response += `⚠️ Protocol registered but activation failed: ${error instanceof Error ? error.message : String(error)}\n`;
+        }
+      } else {
+        response += `💡 The protocol is registered but not active.\n`;
+        response += `   Use protocol_activate to activate it when ready.\n`;
+      }
+
+      // Log to state
+      const current = state.load();
+      if (current) {
+        current.progressLog.push(
+          `[${new Date().toISOString()}] ✅ Protocol approved: ${proposal.protocol.id} - ${reason}`
+        );
+        state.save(current);
+      }
+
+      return {
+        content: [{ type: "text", text: response }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `❌ Error approving proposal: ${error instanceof Error ? error.message : String(error)}` }],
+      };
+    }
+  }
+);
+
+// ============================================================================
+// TOOL: reject_protocol
+// ============================================================================
+server.tool(
+  "reject_protocol",
+  "Reject a pending protocol proposal with a reason.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    proposalId: z.string().describe("ID of the proposal to reject"),
+    reason: z.string().describe("Reason for rejection"),
+    reviewedBy: z.string().optional().describe("Who is rejecting (default: orchestrator)"),
+  },
+  async ({ projectDir, proposalId, reason, reviewedBy }) => {
+    const { state } = await ensureInitialized(projectDir);
+    const proposalManager = getProposalManager(projectDir);
+
+    try {
+      const proposal = proposalManager.reject({
+        proposalId,
+        decision: "reject",
+        reason,
+        reviewedBy: reviewedBy ?? "orchestrator",
+      });
+
+      let response = `❌ Protocol Rejected\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+      response += `📝 Proposal: ${proposalId}\n`;
+      response += `🏷️ Protocol: ${proposal.protocol.name} (${proposal.protocol.id} v${proposal.protocol.version})\n`;
+      response += `👤 Rejected By: ${proposal.reviewedBy}\n`;
+      response += `📅 Rejected At: ${proposal.reviewedAt}\n`;
+      response += `📋 Reason: ${reason}\n\n`;
+
+      // Show validation issues as context
+      const errors = proposal.validation.issues.filter((i: { type: string }) => i.type === "error");
+      if (errors.length > 0) {
+        response += `🔍 Validation issues that may have contributed to rejection:\n`;
+        for (const issue of errors.slice(0, 5)) {
+          response += `   • ${issue.message}\n`;
+        }
+        response += `\n`;
+      }
+
+      response += `💡 The proposer can address the issues and submit a new proposal.\n`;
+
+      // Log to state
+      const current = state.load();
+      if (current) {
+        current.progressLog.push(
+          `[${new Date().toISOString()}] ❌ Protocol rejected: ${proposal.protocol.id} - ${reason}`
+        );
+        state.save(current);
+      }
+
+      return {
+        content: [{ type: "text", text: response }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `❌ Error rejecting proposal: ${error instanceof Error ? error.message : String(error)}` }],
+      };
+    }
+  }
+);
+
+// ============================================================================
+// TOOL: get_base_constraints
+// ============================================================================
+server.tool(
+  "get_base_constraints",
+  "Get the immutable base constraints that all protocols must comply with. These define security boundaries that cannot be overridden.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    format: z.enum(["compact", "pretty", "json"]).optional().describe("Output format (default: pretty)"),
+  },
+  async ({ projectDir, format }) => {
+    await ensureInitialized(projectDir);
+    const baseConstraints = getBaseConstraints();
+
+    if (format === "json") {
+      return {
+        content: [{ type: "text", text: JSON.stringify(baseConstraints, null, 2) }],
+      };
+    }
+
+    const compact = format === "compact";
+
+    let response = compact
+      ? `Base Constraints\n`
+      : `🔒 Base Constraints\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    response += compact
+      ? `These are immutable security constraints.\n\n`
+      : `These are immutable security constraints that all protocols must comply with.\nProtocols violating these constraints will be rejected during validation.\n\n`;
+
+    // Prohibited tools
+    if (baseConstraints.prohibitedTools.length > 0) {
+      response += compact ? `Prohibited Tools: ` : `🚫 Prohibited Tools:\n   `;
+      response += baseConstraints.prohibitedTools.join(", ");
+      response += `\n`;
+      if (!compact) response += `\n`;
+    }
+
+    // Max allowed tools
+    if (baseConstraints.maxAllowedTools && baseConstraints.maxAllowedTools.length > 0) {
+      response += compact ? `Max Allowed Tools: ` : `✅ Maximum Allowed Tools:\n   `;
+      response += baseConstraints.maxAllowedTools.join(", ");
+      response += `\n`;
+      if (!compact) response += `\n`;
+    }
+
+    // Prohibited paths
+    if (baseConstraints.prohibitedPaths.length > 0) {
+      response += compact ? `Prohibited Paths: ` : `📁 Prohibited Paths:\n`;
+      if (compact) {
+        response += baseConstraints.prohibitedPaths.slice(0, 5).join(", ");
+        if (baseConstraints.prohibitedPaths.length > 5) {
+          response += ` (+${baseConstraints.prohibitedPaths.length - 5} more)`;
+        }
+      } else {
+        for (const path of baseConstraints.prohibitedPaths) {
+          response += `   • ${path}\n`;
+        }
+      }
+      response += `\n`;
+      if (!compact) response += `\n`;
+    }
+
+    // Prohibited operations
+    if (baseConstraints.prohibitedOperations.length > 0) {
+      response += compact ? `Prohibited Operations: ` : `⛔ Prohibited Operations:\n`;
+      if (compact) {
+        response += baseConstraints.prohibitedOperations.slice(0, 5).join(", ");
+        if (baseConstraints.prohibitedOperations.length > 5) {
+          response += ` (+${baseConstraints.prohibitedOperations.length - 5} more)`;
+        }
+      } else {
+        for (const op of baseConstraints.prohibitedOperations) {
+          response += `   • ${op}\n`;
+        }
+      }
+      response += `\n`;
+      if (!compact) response += `\n`;
+    }
+
+    // Validation requirements
+    if (!compact) {
+      response += `🔍 Validation Requirements:\n`;
+      response += `   • Pre-execution validation: ${baseConstraints.requirePreValidation ? "Required" : "Optional"}\n`;
+      response += `   • Post-execution validation: ${baseConstraints.requirePostValidation ? "Required" : "Optional"}\n`;
+      response += `   • Audit logging: ${baseConstraints.requireAuditLog ? "Required" : "Optional"}\n\n`;
+    }
+
+    // Limits
+    if (!compact) {
+      response += `📊 Limits:\n`;
+      response += `   • Max allowed tools: ${baseConstraints.maxAllowedTools?.length ?? "Unlimited"}\n`;
+      response += `   • Max allowed paths: ${baseConstraints.maxAllowedPaths?.length ?? "Unlimited"}\n`;
+      response += `   • Audit retention: ${baseConstraints.auditRetentionDays} days\n\n`;
+    }
+
+    // Usage instructions
+    if (!compact) {
+      response += `💡 Usage:\n`;
+      response += `   When proposing protocols, ensure:\n`;
+      response += `   1. No prohibited tools are allowed\n`;
+      response += `   2. No access to prohibited paths\n`;
+      response += `   3. No prohibited operations are enabled\n`;
+      response += `   4. Validation requirements are met in enforcement config\n`;
+    }
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// Helper: Format proposal details
+// ============================================================================
+function formatProposalDetails(proposal: ProtocolProposal): string {
+  let response = ``;
+
+  // Basic info
+  response += `🆔 ID: ${proposal.id}\n`;
+  response += `📊 Status: ${proposal.status.toUpperCase()}\n`;
+  response += `📦 Source: ${proposal.source}\n`;
+  response += `⭐ Priority: ${proposal.priority}\n\n`;
+
+  // Protocol info
+  response += `📋 Protocol:\n`;
+  response += `   ID: ${proposal.protocol.id}\n`;
+  response += `   Version: ${proposal.protocol.version}\n`;
+  response += `   Name: ${proposal.protocol.name}\n`;
+  if (proposal.protocol.description) {
+    response += `   Description: ${proposal.protocol.description}\n`;
+  }
+  response += `   Constraints: ${proposal.protocol.constraints.length}\n`;
+  response += `   Priority: ${proposal.protocol.priority}\n`;
+  response += `   Enforcement: ${proposal.protocol.enforcement.mode}\n`;
+  if (proposal.protocol.tags && proposal.protocol.tags.length > 0) {
+    response += `   Tags: ${proposal.protocol.tags.join(", ")}\n`;
+  }
+  response += `\n`;
+
+  // Description and rationale
+  if (proposal.description) {
+    response += `📝 Description:\n   ${proposal.description}\n\n`;
+  }
+  if (proposal.rationale) {
+    response += `💭 Rationale:\n   ${proposal.rationale}\n\n`;
+  }
+
+  // Validation
+  const validation = proposal.validation;
+  response += `🔍 Validation:\n`;
+  response += `   Valid: ${validation.isValid ? "✅ Yes" : "❌ No"}\n`;
+  response += `   Fixable: ${validation.isFixable ? "✅ Yes" : "❌ No"}\n`;
+  response += `   Time: ${validation.validationTimeMs}ms\n`;
+  response += `   Validated: ${validation.validatedAt}\n\n`;
+
+  // Issues
+  if (validation.issues.length > 0) {
+    const errors = validation.issues.filter((i: { type: string }) => i.type === "error");
+    const warnings = validation.issues.filter((i: { type: string }) => i.type === "warning");
+    const infos = validation.issues.filter((i: { type: string }) => i.type === "info");
+
+    response += `📌 Issues (${validation.issues.length}):\n`;
+    if (errors.length > 0) {
+      response += `   Errors (${errors.length}):\n`;
+      for (const issue of errors.slice(0, 5)) {
+        response += `     ❌ ${issue.message}\n`;
+        if (issue.suggestedFix) {
+          response += `        Fix: ${issue.suggestedFix}\n`;
+        }
+      }
+      if (errors.length > 5) {
+        response += `     ... and ${errors.length - 5} more errors\n`;
+      }
+    }
+    if (warnings.length > 0) {
+      response += `   Warnings (${warnings.length}):\n`;
+      for (const issue of warnings.slice(0, 3)) {
+        response += `     ⚠️ ${issue.message}\n`;
+      }
+      if (warnings.length > 3) {
+        response += `     ... and ${warnings.length - 3} more warnings\n`;
+      }
+    }
+    if (infos.length > 0) {
+      response += `   Info (${infos.length}):\n`;
+      for (const issue of infos.slice(0, 2)) {
+        response += `     ℹ️ ${issue.message}\n`;
+      }
+    }
+    response += `\n`;
+  }
+
+  // Risk assessment
+  const risk = validation.riskAssessment;
+  response += `⚠️ Risk Assessment:\n`;
+  response += `   Overall Score: ${risk.overallScore}/100\n`;
+  response += `   Level: ${risk.riskLevel.toUpperCase()}\n`;
+  response += `   Acceptable: ${risk.isAcceptable ? "✅ Yes" : "❌ No"} (threshold: ${risk.acceptanceThreshold})\n`;
+
+  if (risk.factors && risk.factors.length > 0) {
+    response += `   \n   Risk Factors:\n`;
+    const topFactors = risk.factors
+      .sort((a: { score: number }, b: { score: number }) => b.score - a.score)
+      .slice(0, 5);
+    for (const factor of topFactors) {
+      const bar = "█".repeat(Math.floor(factor.score / 10)) + "░".repeat(10 - Math.floor(factor.score / 10));
+      response += `     ${factor.category}: [${bar}] ${factor.score}\n`;
+    }
+  }
+
+  if (risk.recommendations && risk.recommendations.length > 0) {
+    response += `   \n   Recommendations:\n`;
+    for (const rec of risk.recommendations.slice(0, 3)) {
+      response += `     • ${rec}\n`;
+    }
+  }
+  response += `\n`;
+
+  // Timeline
+  response += `📅 Timeline:\n`;
+  response += `   Submitted: ${proposal.submittedAt}\n`;
+  if (proposal.submittedBy) {
+    response += `   Submitted By: ${proposal.submittedBy}\n`;
+  }
+  if (proposal.expiresAt && proposal.status === "pending") {
+    response += `   Expires: ${proposal.expiresAt}\n`;
+  }
+  if (proposal.reviewedAt) {
+    response += `   Reviewed: ${proposal.reviewedAt}\n`;
+    if (proposal.reviewedBy) {
+      response += `   Reviewed By: ${proposal.reviewedBy}\n`;
+    }
+  }
+  if (proposal.reviewReason) {
+    response += `   Review Reason: ${proposal.reviewReason}\n`;
+  }
+
+  return response;
+}
+
+// ============================================================================
+// TOOL: validate_feature_protocols
+// ============================================================================
+server.tool(
+  "validate_feature_protocols",
+  "Validate a feature against all active protocols before starting a worker. Returns whether the feature can proceed and any constraint violations.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    featureId: z.string().describe("ID of the feature to validate"),
+    customPrompt: z.string().optional().describe("Optional custom prompt to include in validation context"),
+  },
+  async ({ projectDir, featureId, customPrompt }) => {
+    const { state, protocols } = await ensureInitialized(projectDir);
+
+    // Validate feature ID
+    try {
+      validateFeatureId(featureId);
+    } catch (error: any) {
+      return {
+        content: [{ type: "text", text: `Invalid feature ID: ${error.message}` }],
+      };
+    }
+
+    const current = state.load();
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active session. Use orchestrator_init first." }],
+      };
+    }
+
+    const feature = current.features.find((f) => f.id === featureId);
+    if (!feature) {
+      return {
+        content: [{ type: "text", text: `Feature '${featureId}' not found.` }],
+      };
+    }
+
+    // Check if there are active protocols
+    const activeProtocols = protocols.getActiveProtocols();
+    if (activeProtocols.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `✅ Feature Validation: ${featureId}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nNo active protocols to validate against.\nThe feature can proceed without protocol constraints.\n\nUse protocol_register and protocol_activate to add behavioral governance.`,
+          },
+        ],
+      };
+    }
+
+    // Import enforcement integration dynamically to avoid circular deps
+    const { ProtocolResolver } = await import("./protocols/resolver.js");
+    const { EnforcementEngine } = await import("./protocols/enforcement.js");
+
+    const resolver = new ProtocolResolver();
+    const engine = new EnforcementEngine(protocols, resolver);
+
+    // Build execution context for validation
+    const context = {
+      featureId: feature.id,
+      projectDir,
+      actionType: "tool_call" as const,
+      actionName: "spawn_worker",
+      actionParams: {
+        featureDescription: feature.description,
+        customPrompt,
+        attempt: feature.attempts + 1,
+      },
+      timestamp: new Date().toISOString(),
+    };
+
+    const result = engine.validatePreExecution(context);
+
+    // Build response
+    let response = `🔍 Feature Validation: ${featureId}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    response += `Feature: ${feature.description.slice(0, 60)}${feature.description.length > 60 ? "..." : ""}\n`;
+    response += `Status: ${feature.status}\n`;
+    response += `Attempts: ${feature.attempts}\n\n`;
+
+    response += `📋 Active Protocols (${activeProtocols.length}):\n`;
+    for (const p of activeProtocols.slice(0, 5)) {
+      const applied = result.appliedProtocols.includes(p.id);
+      response += `   ${applied ? "✓" : "○"} ${p.id} (${p.name})\n`;
+    }
+    if (activeProtocols.length > 5) {
+      response += `   ... and ${activeProtocols.length - 5} more\n`;
+    }
+    response += `\n`;
+
+    response += `⏱️ Evaluation Time: ${result.evaluationTimeMs}ms\n\n`;
+
+    if (result.allowed) {
+      response += `✅ Result: ALLOWED\n`;
+      response += `   The feature passes all protocol constraints.\n`;
+
+      if (result.warnings.length > 0) {
+        response += `\n⚠️ Warnings (${result.warnings.length}):\n`;
+        for (const warning of result.warnings.slice(0, 5)) {
+          response += `   • [${warning.protocolId}] ${warning.message}\n`;
+        }
+        if (result.warnings.length > 5) {
+          response += `   ... and ${result.warnings.length - 5} more warnings\n`;
+        }
+      }
+    } else {
+      response += `❌ Result: BLOCKED\n`;
+      response += `   The feature violates protocol constraints.\n\n`;
+
+      response += `🚫 Violations (${result.violations.length}):\n`;
+      for (const v of result.violations.slice(0, 10)) {
+        response += `   ❌ [${v.protocolId}] ${v.constraintId}\n`;
+        response += `      Severity: ${v.severity.toUpperCase()}\n`;
+        response += `      Message: ${v.message}\n`;
+        if (v.remediation) {
+          response += `      Fix: ${v.remediation}\n`;
+        }
+        response += `\n`;
+      }
+      if (result.violations.length > 10) {
+        response += `   ... and ${result.violations.length - 10} more violations\n`;
+      }
+
+      response += `\n💡 Suggested Action: ${result.suggestedAction || "abort"}\n`;
+    }
+
+    // Log to state
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 🔍 Validated ${featureId}: ${result.allowed ? "ALLOWED" : "BLOCKED"} (${result.violations.length} violations, ${result.warnings.length} warnings)`
+    );
+    state.save(current);
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: get_violations
+// ============================================================================
+server.tool(
+  "get_violations",
+  "Get protocol violations with optional filtering. Shows violations recorded during enforcement.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    protocolId: z.string().optional().describe("Filter by protocol ID"),
+    featureId: z.string().optional().describe("Filter by feature ID"),
+    workerId: z.string().optional().describe("Filter by worker ID"),
+    resolved: z.boolean().optional().describe("Filter by resolved status (true/false, omit for all)"),
+    severity: z.enum(["error", "warning", "info"]).optional().describe("Filter by severity"),
+    limit: z.number().int().min(1).max(100).optional().describe("Maximum violations to return (default: 20)"),
+    offset: z.number().int().min(0).optional().describe("Skip first N violations (default: 0)"),
+    format: z.enum(["compact", "pretty"]).optional().describe("Output format (default: pretty)"),
+  },
+  async ({ projectDir, protocolId, featureId, workerId, resolved, severity, limit = 20, offset = 0, format = "pretty" }) => {
+    const { protocols } = await ensureInitialized(projectDir);
+
+    const violations = protocols.getViolations({
+      protocolId,
+      featureId,
+      workerId,
+      resolved,
+      severity,
+      limit,
+      offset,
+    });
+
+    const totalCount = protocols.getViolationCount({ protocolId, resolved });
+    const unresolvedCount = protocols.getViolationCount({ protocolId, resolved: false });
+
+    if (format === "compact") {
+      let text = `Violations: ${totalCount} total, ${unresolvedCount} unresolved\n`;
+      if (violations.length === 0) {
+        text += `No violations matching filters.\n`;
+      } else {
+        for (const v of violations) {
+          const status = v.resolved ? "[R]" : "[U]";
+          text += `${status} ${v.id}: [${v.severity}] ${v.protocolId}/${v.constraintId} - ${v.message.slice(0, 50)}...\n`;
+        }
+        if (totalCount > offset + violations.length) {
+          text += `... use offset=${offset + limit} to see more\n`;
+        }
+      }
+      return { content: [{ type: "text", text }] };
+    }
+
+    // Pretty format
+    let response = `🚨 Protocol Violations\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    response += `📊 Summary:\n`;
+    response += `   Total: ${totalCount}\n`;
+    response += `   Unresolved: ${unresolvedCount}\n`;
+    response += `   Showing: ${violations.length} (offset: ${offset})\n\n`;
+
+    if (protocolId || featureId || workerId || resolved !== undefined || severity) {
+      response += `🔍 Filters:\n`;
+      if (protocolId) response += `   Protocol: ${protocolId}\n`;
+      if (featureId) response += `   Feature: ${featureId}\n`;
+      if (workerId) response += `   Worker: ${workerId}\n`;
+      if (resolved !== undefined) response += `   Resolved: ${resolved}\n`;
+      if (severity) response += `   Severity: ${severity}\n`;
+      response += `\n`;
+    }
+
+    if (violations.length === 0) {
+      response += `No violations matching the specified filters.\n`;
+      if (totalCount === 0) {
+        response += `\n💡 No protocol violations have been recorded.\nViolations are recorded when workers or features violate protocol constraints.`;
+      }
+    } else {
+      for (const v of violations) {
+        const statusIcon = v.resolved ? "✅" : "❌";
+        const severityIcon = v.severity === "error" ? "🔴" : v.severity === "warning" ? "🟡" : "🔵";
+
+        response += `┌────────────────────────────────────\n`;
+        response += `│ ${statusIcon} ${v.id}\n`;
+        response += `│ ${severityIcon} Severity: ${v.severity.toUpperCase()}\n`;
+        response += `│ Protocol: ${v.protocolId}\n`;
+        response += `│ Constraint: ${v.constraintId}\n`;
+        if (v.featureId) response += `│ Feature: ${v.featureId}\n`;
+        if (v.workerId) response += `│ Worker: ${v.workerId}\n`;
+        response += `│ Time: ${v.timestamp}\n`;
+        response += `│ Message: ${v.message}\n`;
+        if (v.resolved) {
+          response += `│ ✅ Resolved: ${v.resolvedAt}\n`;
+          if (v.resolution) {
+            response += `│    Resolution: ${v.resolution}\n`;
+          }
+        }
+        response += `└────────────────────────────────────\n\n`;
+      }
+
+      if (totalCount > offset + violations.length) {
+        response += `📄 Showing ${violations.length} of ${totalCount} violations.\n`;
+        response += `   Use offset=${offset + limit} to see more.\n`;
+      }
+    }
+
+    response += `\n💡 Use resolve_violation to mark violations as resolved.`;
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: resolve_violation
+// ============================================================================
+server.tool(
+  "resolve_violation",
+  "Mark a protocol violation as resolved with a resolution note.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    violationId: z.string().describe("ID of the violation to resolve"),
+    resolution: z.string().min(1).max(500).describe("Description of how the violation was resolved"),
+  },
+  async ({ projectDir, violationId, resolution }) => {
+    const { protocols, state } = await ensureInitialized(projectDir);
+
+    try {
+      protocols.resolveViolation(violationId, resolution, "orchestrator");
+
+      // Log to state
+      const current = state.load();
+      if (current) {
+        current.progressLog.push(
+          `[${new Date().toISOString()}] ✅ Resolved violation: ${violationId}`
+        );
+        state.save(current);
+      }
+
+      // Get updated stats
+      const stats = protocols.getStats();
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `✅ Violation Resolved\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nViolation ID: ${violationId}\nResolution: ${resolution}\nResolved At: ${new Date().toISOString()}\n\n📊 Updated Stats:\n   Total Violations: ${stats.totalViolations}\n   Unresolved: ${stats.unresolvedViolations}\n\nThe violation has been marked as resolved in the audit log.`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `❌ Failed to resolve violation: ${error.message}\n\nUse get_violations to see available violation IDs.`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+// ============================================================================
+// TOOL: get_audit_log
+// ============================================================================
+server.tool(
+  "get_audit_log",
+  "Get the protocol audit log. Shows all protocol operations including registrations, activations, violations, and resolutions.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    protocolId: z.string().optional().describe("Filter by protocol ID"),
+    action: z.enum(["register", "activate", "deactivate", "update", "delete", "violation", "resolve_violation"]).optional()
+      .describe("Filter by action type"),
+    limit: z.number().int().min(1).max(100).optional().describe("Maximum entries to return (default: 20)"),
+    offset: z.number().int().min(0).optional().describe("Skip first N entries (default: 0)"),
+    format: z.enum(["compact", "pretty"]).optional().describe("Output format (default: pretty)"),
+  },
+  async ({ projectDir, protocolId, action, limit = 20, offset = 0, format = "pretty" }) => {
+    const { protocols } = await ensureInitialized(projectDir);
+
+    const entries = protocols.getAuditLog({
+      protocolId,
+      action,
+      limit,
+      offset,
+    });
+
+    const stats = protocols.getStats();
+
+    if (format === "compact") {
+      let text = `Audit Log: ${stats.auditLogSize} entries\n`;
+      if (entries.length === 0) {
+        text += `No entries matching filters.\n`;
+      } else {
+        for (const e of entries) {
+          const protoLabel = e.protocolId ? `[${e.protocolId}]` : "";
+          text += `${e.timestamp.slice(0, 19)} ${e.action.toUpperCase()} ${protoLabel}\n`;
+        }
+        if (stats.auditLogSize > offset + entries.length) {
+          text += `... use offset=${offset + limit} to see more\n`;
+        }
+      }
+      return { content: [{ type: "text", text }] };
+    }
+
+    // Pretty format
+    let response = `📜 Protocol Audit Log\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    response += `📊 Summary:\n`;
+    response += `   Total Entries: ${stats.auditLogSize}\n`;
+    response += `   Showing: ${entries.length} (offset: ${offset})\n\n`;
+
+    if (protocolId || action) {
+      response += `🔍 Filters:\n`;
+      if (protocolId) response += `   Protocol: ${protocolId}\n`;
+      if (action) response += `   Action: ${action}\n`;
+      response += `\n`;
+    }
+
+    if (entries.length === 0) {
+      response += `No audit entries matching the specified filters.\n`;
+      if (stats.auditLogSize === 0) {
+        response += `\n💡 The audit log is empty. Entries are created when:\n`;
+        response += `   • Protocols are registered, activated, or deactivated\n`;
+        response += `   • Violations are recorded or resolved\n`;
+        response += `   • Protocol configurations are updated\n`;
+      }
+    } else {
+      for (const e of entries) {
+        const actionIcon = getActionIcon(e.action);
+
+        response += `┌────────────────────────────────────\n`;
+        response += `│ ${actionIcon} ${e.action.toUpperCase()}\n`;
+        response += `│ ID: ${e.id}\n`;
+        response += `│ Time: ${e.timestamp}\n`;
+        if (e.protocolId) response += `│ Protocol: ${e.protocolId}\n`;
+        if (e.actor) response += `│ Actor: ${e.actor}\n`;
+
+        // Format details based on action type
+        if (Object.keys(e.details).length > 0) {
+          response += `│ Details:\n`;
+          for (const [key, value] of Object.entries(e.details)) {
+            const valueStr = typeof value === "object" ? JSON.stringify(value) : String(value);
+            response += `│   ${key}: ${valueStr.slice(0, 60)}${valueStr.length > 60 ? "..." : ""}\n`;
+          }
+        }
+        response += `└────────────────────────────────────\n\n`;
+      }
+
+      if (stats.auditLogSize > offset + entries.length) {
+        response += `📄 Showing ${entries.length} of ${stats.auditLogSize} entries.\n`;
+        response += `   Use offset=${offset + limit} to see more.\n`;
+      }
+    }
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+/**
+ * Get icon for audit action type
+ */
+function getActionIcon(action: string): string {
+  switch (action) {
+    case "register":
+      return "📋";
+    case "activate":
+      return "▶️";
+    case "deactivate":
+      return "⏸️";
+    case "update":
+      return "🔄";
+    case "delete":
+      return "🗑️";
+    case "violation":
+      return "🚨";
+    case "resolve_violation":
+      return "✅";
+    default:
+      return "📝";
+  }
+}
 
 // ============================================================================
 // Start the server

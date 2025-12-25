@@ -27,6 +27,56 @@ import { ComplexityResult } from "../utils/complexity-detector.js";
 import { PlanSubmission } from "../utils/plan-evaluator.js";
 import { ConfidenceAlert } from "../workers/confidence.js";
 
+/**
+ * DocumentationRef - Reference to documentation that provides context for a feature
+ * Used for protocol-based behavioral governance to provide relevant docs to workers
+ */
+export interface DocumentationRef {
+  type: "file" | "url" | "snippet";
+  path: string; // File path, URL, or identifier
+  title?: string; // Human-readable title
+  relevance?: string; // Why this doc is relevant to the feature
+  section?: string; // Specific section within the document
+}
+
+/**
+ * PreparedContext - Pre-processed context information for efficient worker startup
+ * Contains extracted/summarized information ready for injection into worker prompts
+ */
+export interface PreparedContext {
+  key: string; // Unique identifier for this context block
+  content: string; // The actual context content
+  source?: string; // Where this context came from
+  priority: "required" | "recommended" | "optional";
+  tokenEstimate?: number; // Estimated token count for budget management
+}
+
+/**
+ * ProtocolBinding - Binds a protocol to a feature for behavioral governance
+ * Protocols define constraints, validations, and behavioral rules for workers
+ */
+export interface ProtocolBinding {
+  protocolId: string; // Reference to the protocol in the registry
+  version?: string; // Optional version constraint
+  scope: "pre_execution" | "post_execution" | "continuous" | "all";
+  priority: number; // Higher priority protocols are enforced first
+  parameters?: Record<string, unknown>; // Protocol-specific parameters
+  overrides?: Record<string, unknown>; // Override default protocol settings
+}
+
+/**
+ * RoutingConfig - Configuration for routing a feature to appropriate workers
+ * Enables intelligent task assignment based on feature characteristics
+ */
+export interface RoutingConfig {
+  preferredWorkerType?: string; // Hint for worker specialization
+  requiredCapabilities?: string[]; // Capabilities the worker must have
+  excludeCapabilities?: string[]; // Capabilities to avoid
+  maxParallelism?: number; // Max concurrent workers for this feature
+  affinityGroup?: string; // Group features that should run on same worker
+  isolationLevel?: "none" | "session" | "process" | "container";
+}
+
 export interface Feature {
   id: string;
   description: string;
@@ -48,6 +98,14 @@ export interface Feature {
     selectedPlan?: "A" | "B";
     selectionReason?: string;
   };
+
+  // Protocol-based behavioral governance fields
+  context?: {
+    documentation: DocumentationRef[]; // References to relevant documentation
+    prepared: PreparedContext[]; // Pre-processed context for worker injection
+  };
+  protocolBindings?: ProtocolBinding[]; // Protocols bound to this feature
+  routing?: RoutingConfig; // Routing configuration for worker assignment
 }
 
 export interface WorkerStatus {

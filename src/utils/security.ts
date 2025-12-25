@@ -276,6 +276,60 @@ export const CompetingPlansSchema = z.object({
 });
 
 /**
+ * Zod schema for documentation reference
+ */
+export const DocumentationRefSchema = z.object({
+  type: z.enum(["file", "url", "snippet"]),
+  path: z.string().max(2000),
+  title: z.string().max(200).optional(),
+  relevance: z.string().max(500).optional(),
+  section: z.string().max(200).optional(),
+});
+
+/**
+ * Zod schema for prepared context
+ */
+export const PreparedContextSchema = z.object({
+  key: z.string().regex(/^[a-zA-Z0-9_-]+$/).max(64),
+  content: z.string().max(50000), // Allow up to ~12.5k tokens
+  source: z.string().max(500).optional(),
+  priority: z.enum(["required", "recommended", "optional"]),
+  tokenEstimate: z.number().int().min(0).optional(),
+});
+
+/**
+ * Zod schema for protocol binding
+ */
+export const ProtocolBindingSchema = z.object({
+  protocolId: z.string().regex(/^[a-zA-Z0-9_-]+$/).max(64),
+  version: z.string().max(32).optional(),
+  scope: z.enum(["pre_execution", "post_execution", "continuous", "all"]),
+  priority: z.number().int().min(0).max(1000),
+  parameters: z.record(z.unknown()).optional(),
+  overrides: z.record(z.unknown()).optional(),
+});
+
+/**
+ * Zod schema for feature context
+ */
+export const FeatureContextSchema = z.object({
+  documentation: z.array(DocumentationRefSchema),
+  prepared: z.array(PreparedContextSchema),
+});
+
+/**
+ * Zod schema for routing configuration
+ */
+export const RoutingConfigSchema = z.object({
+  preferredWorkerType: z.string().max(64).optional(),
+  requiredCapabilities: z.array(z.string().max(64)).optional(),
+  excludeCapabilities: z.array(z.string().max(64)).optional(),
+  maxParallelism: z.number().int().min(1).max(100).optional(),
+  affinityGroup: z.string().max(64).optional(),
+  isolationLevel: z.enum(["none", "session", "process", "container"]).optional(),
+});
+
+/**
  * Zod schema for validating feature structure
  */
 export const FeatureSchema = z.object({
@@ -293,6 +347,10 @@ export const FeatureSchema = z.object({
   complexity: ComplexityResultSchema.optional(),
   planningPhase: z.enum(["planning", "evaluating", "implementing"]).nullable().optional(),
   competingPlans: CompetingPlansSchema.optional(),
+  // Protocol-based behavioral governance fields
+  context: FeatureContextSchema.optional(),
+  protocolBindings: z.array(ProtocolBindingSchema).optional(),
+  routing: RoutingConfigSchema.optional(),
 });
 
 /**
