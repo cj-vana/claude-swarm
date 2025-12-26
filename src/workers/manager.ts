@@ -200,19 +200,28 @@ ${projectContext}
 1. Focus ONLY on implementing this specific feature
 2. Make small, incremental changes
 3. Test your changes as you go
-4. When you are DONE, create a file at: .claude/orchestrator/workers/${feature.id}.done
-   with a brief summary of what you implemented
-5. Do NOT commit your changes - the orchestrator will handle commits
+4. When you are DONE:
+   - Commit your changes following conventional commit format:
+     * Use: feat(scope), fix(scope), docs(scope), refactor(scope), test(scope)
+     * Example: "feat(auth): add user authentication system"
+     * Add footer: "🤖 Committed by claude-swarm worker ${feature.id}"
+   - Create a file at: .claude/orchestrator/workers/${feature.id}.done
+     with a brief summary of what you implemented
 
 ## Important
 - Do not work on other features
 - If you encounter a blocker, document it in the .done file and stop
 - Keep changes minimal and focused
-- NEVER commit, stage, or git add ANY of these files:
-  - .claude/ (entire directory - orchestrator state, logs, prompts, worker files)
-  - claude-progress.txt
-  - init.sh
-  - *.prompt, *.log, *.done, *.status files in .claude/
+- Always commit using conventional commit format with the worker attribution footer
+- The .claude/ directory is already gitignored - don't worry about it
+
+## Commit Format Example
+\`\`\`bash
+git add .
+git commit -m "feat(feature-name): implement the feature
+
+🤖 Committed by claude-swarm worker ${feature.id}"
+\`\`\`
 
 ${customPrompt ? `\n## Additional Context\n${customPrompt}` : ""}
 

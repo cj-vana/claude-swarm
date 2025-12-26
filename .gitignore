@@ -25,3 +25,6 @@ coverage/
 
 # Auto-generated scripts
 init.sh
+
+# Orchestrator state (workers should not commit this)
+.claude/
