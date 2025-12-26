@@ -11,7 +11,11 @@
     "build": "tsc && cp -r src/dashboard/public dist/dashboard/",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
-    "inspector": "npx @anthropics/mcp-inspector node dist/index.js"
+    "inspector": "npx @anthropics/mcp-inspector node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui",
+    "test:coverage": "vitest run --coverage"
   },
   "keywords": [
     "mcp",
@@ -32,6 +36,9 @@
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^22.0.0",
-    "typescript": "^5.7.0"
+    "@vitest/coverage-v8": "^4.0.16",
+    "@vitest/ui": "^4.0.16",
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.16"
   }
 }

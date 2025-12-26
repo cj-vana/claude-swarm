@@ -64,6 +64,9 @@ This is an MCP (Model Context Protocol) server that orchestrates parallel Claude
 |----------|---------|-------------|
 | `DASHBOARD_PORT` | `3456` | Dashboard HTTP port |
 | `ENABLE_DASHBOARD` | `true` | Set to `false` to disable |
+| `CLAUDE_SWARM_ALLOWED_TOOLS` | `Bash,Read,Write,Edit,Glob,Grep,Task,TodoWrite` | Comma-separated tools workers can use |
+| `CLAUDE_SWARM_PERMISSION_MODE` | `bypassPermissions` | Permission mode for workers (headless) |
+| `CLAUDE_SWARM_MCP_SERVERS` | `{}` | JSON object of MCP servers to give workers access to |
 
 ## Dependencies
 

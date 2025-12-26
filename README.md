@@ -6,6 +6,9 @@ An MCP server for orchestrating parallel Claude Code worker swarms. Enables mult
 
 - **Persistent State** - Session state survives context compaction
 - **Parallel Workers** - Run multiple Claude Code workers simultaneously via tmux
+- **Multi-Agent Voting** - Critical features get 2-3 redundant implementations; best wins via scoring
+- **Auto-Orchestration** - Automatically schedule workers by priority, dependencies, and complexity
+- **Model Selection** - Choose haiku/sonnet/opus per worker for optimal cost/performance
 - **Competitive Planning** - Complex features get two competing implementation plans; the best wins
 - **Confidence Monitoring** - Multi-signal confidence scoring alerts when workers struggle
 - **Real-time Dashboard** - Web UI for monitoring at `http://localhost:3456`
@@ -13,6 +16,8 @@ An MCP server for orchestrating parallel Claude Code worker swarms. Enables mult
 - **Feature Dependencies** - Define execution order between features
 - **Live Terminal Streaming** - Watch worker output in real-time
 - **Git Checkpoints** - Commit progress after each feature
+- **Chrome DevTools Integration** - Workers test web features using browser automation
+- **Code Change Validation** - Warns if workers claim completion without actual code changes
 
 ## Quick Start
 
@@ -101,6 +106,74 @@ Real-time confidence scoring detects when workers are struggling:
 
 When confidence drops below threshold, alerts are logged to the progress log.
 
+## Multi-Agent Voting
+
+For critical features where correctness is crucial, spawn 2-3 redundant workers and let the best solution win:
+
+```
+1. start_voting_workers(featureId, voterCount=3)  # Start redundant workers
+2. [wait 5-10 minutes for voters to complete]
+3. evaluate_voting_results(featureId)            # Score and select winner
+```
+
+**How Voting Works:**
+- Each worker implements the feature independently with a slightly different approach
+- **Voter 1**: Prioritizes simplicity and readability
+- **Voter 2**: Prioritizes performance and efficiency
+- **Voter 3**: Prioritizes maintainability and testing
+
+**Scoring (0-100):**
+- **+40 points**: Tests pass
+- **+30 points**: Minimal code changes (fewer lines = better)
+- **+20 points**: Detailed .done file (lists files modified, tests run)
+- **+10 points**: No errors in worker log
+
+Winner's solution gets applied, losers discarded. Use for high-risk features like authentication, payment processing, or database migrations.
+
+## Auto-Orchestration
+
+Let the system automatically schedule workers based on intelligent priority calculation:
+
+```
+auto_orchestrate(strategy="adaptive", maxConcurrent=5)
+```
+
+**Strategies:**
+- **breadth-first** - Work on independent features first, maximize parallelization
+- **depth-first** - Unblock dependency chains first, clear critical paths
+- **adaptive** - Balance both approaches based on feature complexity and attempts
+
+**Priority Scoring:**
+- +50 points per feature this unblocks
+- +40 points if no dependencies (can start immediately)
+- +30 points for low complexity tasks
+- -20 points per failed attempt
+
+Returns an execution plan with next batch of features to start. Execute with `start_parallel_workers`.
+
+## Model Selection
+
+Choose the right model for each worker to balance cost and capability:
+
+```typescript
+// Start single worker with specific model
+start_worker(featureId="feature-1", model="haiku")
+
+// Start parallel workers with different models
+start_parallel_workers(
+  featureIds=["feature-1", "feature-2"],
+  models={
+    "feature-1": "haiku",    // Fast, cheap for simple tasks
+    "feature-2": "sonnet"    // Balanced for complex tasks
+  }
+)
+```
+
+**Model Guide:**
+- **haiku** - 5-30min tasks, bug fixes, simple features (fast & cheap)
+- **sonnet** - 1-2hr tasks, complex features, refactoring (balanced)
+- **opus** - Multi-hour tasks, architectural changes (maximum capability)
+
 ## Web Dashboard
 
 Real-time monitoring dashboard at **http://localhost:3456**
@@ -175,6 +248,17 @@ Real-time monitoring dashboard at **http://localhost:3456**
 |------|-------------|
 | `get_worker_confidence` | Get detailed confidence breakdown for a worker |
 | `set_confidence_threshold` | Configure alert threshold (default: 35%) |
+
+### Multi-Agent Voting
+| Tool | Description |
+|------|-------------|
+| `start_voting_workers` | Start 2-3 redundant workers for critical features |
+| `evaluate_voting_results` | Score and select winning solution |
+
+### Auto-Orchestration
+| Tool | Description |
+|------|-------------|
+| `auto_orchestrate` | Automatically schedule workers by priority and dependencies |
 
 ### Feature Management
 | Tool | Description |

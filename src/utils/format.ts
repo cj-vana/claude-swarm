@@ -36,9 +36,9 @@ export function truncate(str: string, maxLength: number): string {
  * Create a simple progress bar
  */
 export function progressBar(current: number, total: number, width: number = 20): string {
-  const percent = total > 0 ? current / total : 0;
+  const percent = total > 0 ? Math.min(current / total, 1) : 0; // Cap at 100%
   const filled = Math.round(width * percent);
-  const empty = width - filled;
+  const empty = Math.max(width - filled, 0); // Prevent negative
   return `[${"█".repeat(filled)}${"░".repeat(empty)}] ${current}/${total}`;
 }
 

@@ -86,9 +86,11 @@ export function validateFeatureId(id: string): string {
 /**
  * Validate tmux session name
  * Supports both worker sessions (cc-worker-*) and planner sessions (cc-planner-*)
+ * Format: cc-(worker|planner)-{featureId}-{hash}
+ * Hash must be at least 6 lowercase hex characters
  */
 export function validateSessionName(name: string): boolean {
-  return /^cc-(worker|planner)-[a-zA-Z0-9_-]+-[a-z0-9]+$/.test(name);
+  return /^cc-(worker|planner)-[a-zA-Z0-9_-]+-[a-z0-9]{6,}$/.test(name);
 }
 
 /**
@@ -155,18 +157,20 @@ const DANGEROUS_PATTERNS = [
 /**
  * Validate a verification command
  * Returns the command if valid, throws if not
+ * SECURITY: Check dangerous patterns BEFORE trimming to prevent bypass
  */
 export function validateCommand(command: string): string {
-  const trimmed = command.trim();
-
-  // Check for dangerous patterns
+  // Check for dangerous patterns BEFORE trimming (security-critical)
   for (const pattern of DANGEROUS_PATTERNS) {
-    if (trimmed.includes(pattern)) {
+    if (command.includes(pattern)) {
       throw new Error(
         `Command contains disallowed shell operator: ${pattern}`
       );
     }
   }
+
+  // Now safe to trim
+  const trimmed = command.trim();
 
   // Check against allowed patterns
   const isAllowed = ALLOWED_COMMAND_PATTERNS.some((pattern) =>

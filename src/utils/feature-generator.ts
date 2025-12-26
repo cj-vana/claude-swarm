@@ -27,8 +27,8 @@ export function generateFeatureList(taskDescription: string): Feature[] {
     const trimmed = line.trim();
     // Look for numbered items, bullet points, or feature-like descriptions
     return (
-      trimmed.match(/^\d+[\.\)]\s+/) ||  // 1. or 1)
-      trimmed.match(/^[-*]\s+/) ||        // - or *
+      trimmed.match(/^\d+[\.\)]\s*/) ||  // 1. or 1) - space optional
+      trimmed.match(/^[-*]\s*/) ||        // - or * - space optional
       trimmed.match(/^(?:feature|implement|add|create|build|fix|update):/i)
     );
   });
@@ -36,7 +36,10 @@ export function generateFeatureList(taskDescription: string): Feature[] {
   if (lines.length > 0) {
     return lines.map((line, i) => ({
       id: `feature-${i + 1}`,
-      description: line.replace(/^[\d\.\)\-\*\s]+/, "").trim(),
+      description: line
+        .replace(/^[\d\.\)\-\*\s]+/, "")  // Remove numbers, bullets
+        .replace(/^(?:feature|implement|add|create|build|fix|update):\s*/i, "")  // Remove keyword prefixes
+        .trim(),
       status: "pending" as const,
       attempts: 0,
     }));
