@@ -41,6 +41,17 @@ export { createEnforcementIntegration } from "./enforcement-integration.js";
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
+// Claude Code authentication environment variables
+const CLAUDE_AUTH_ENV = {
+  SESSION_ID: 'CLAUDE_CODE_SESSION_ID',
+  ENTRYPOINT: 'CLAUDE_CODE_ENTRYPOINT',
+  ENABLED: 'CLAUDECODE',
+} as const;
+
+// Expected session ID format: h<version>_<base64-like-token>
+// Examples: h0_abc123, h1_xyz789
+const SESSION_ID_PATTERN = /^h\d+_[A-Za-z0-9_-]+$/;
+
 interface StartWorkerResult {
   success: boolean;
   sessionName?: string;
@@ -92,6 +103,8 @@ export class WorkerManager {
   private lastKnownStatus: Map<string, string> = new Map();
   // Optional enforcement integration for protocol governance
   private enforcement: EnforcementIntegration | null = null;
+  // Claude Code session ID for worker authentication
+  private sessionId: string | undefined;
 
   constructor(projectDir: string, stateManager: StateManager) {
     this.projectDir = projectDir;
@@ -106,6 +119,25 @@ export class WorkerManager {
     );
     if (!fs.existsSync(this.workerDir)) {
       fs.mkdirSync(this.workerDir, { recursive: true });
+    }
+
+    // Capture parent Claude Code session ID for worker authentication
+    // Workers spawned in tmux need this to authenticate with Claude Code
+    // Note: Captured at construction time; re-authenticating requires orchestrator restart
+    this.sessionId = process.env[CLAUDE_AUTH_ENV.SESSION_ID];
+
+    // Validate session ID format if present
+    if (this.sessionId && !SESSION_ID_PATTERN.test(this.sessionId)) {
+      console.error(
+        `[WorkerManager] CRITICAL: CLAUDE_CODE_SESSION_ID has an invalid format.`
+      );
+      console.error(
+        `[WorkerManager] Received: "${this.sessionId.substring(0, 20)}...", Expected format: h<version>_<token>`
+      );
+      console.error(
+        `[WorkerManager] Unsetting session ID to prevent worker authentication failures.`
+      );
+      this.sessionId = undefined;
     }
   }
 
@@ -465,6 +497,19 @@ echo 'PLANNER_EXITED' >> ${shellQuote(logFile)}
       };
     }
 
+    // Preflight: Check if we have Claude Code session authentication
+    if (!this.sessionId) {
+      return {
+        success: false,
+        error: "No Claude Code session ID found. Workers cannot authenticate.\n\n" +
+               "This error occurs when:\n" +
+               "- claude-swarm is not running from within Claude Code\n" +
+               "- CLAUDE_CODE_SESSION_ID environment variable is not set\n\n" +
+               "Solution: Ensure you're running this MCP server from within Claude Code, not a standalone terminal.\n" +
+               "Run: echo $CLAUDE_CODE_SESSION_ID (should output a session ID like 'h0_...')",
+      };
+    }
+
     // Pre-spawn validation: Check if active protocols allow this worker to spawn
     let enforcementValidation: PreSpawnValidationResult | undefined;
     if (this.enforcement) {
@@ -519,6 +564,15 @@ echo 'PLANNER_EXITED' >> ${shellQuote(logFile)}
       const scriptContent = `#!/bin/bash
 set -e
 cd ${shellQuote(this.projectDir)}
+
+# Pass parent Claude Code session for authentication
+# CLAUDE_CODE_SESSION_ID: Session token for subscription-based authentication
+${this.sessionId ? `export ${CLAUDE_AUTH_ENV.SESSION_ID}=${shellQuote(this.sessionId)}` : '# No session ID available - worker may fail to authenticate'}
+# CLAUDE_CODE_ENTRYPOINT: Tells Claude CLI this is running in CLI context (not web/app)
+export ${CLAUDE_AUTH_ENV.ENTRYPOINT}=cli
+# CLAUDECODE: Flag indicating we're running within Claude Code environment
+export ${CLAUDE_AUTH_ENV.ENABLED}=1
+
 PROMPT=$(cat ${shellQuote(promptFile)})
 claude -p "$PROMPT" --allowedTools Bash,Read,Write,Edit,Glob,Grep 2>&1 | tee ${shellQuote(logFile)}
 echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
@@ -538,6 +592,9 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
         wrapperScript,
       ]);
 
+      // Log session info for debugging authentication issues
+      console.log(`[Worker ${feature.id}] Spawned with session ID: ${this.sessionId ? 'present' : 'MISSING'}`);
+
       // Create status file
       const statusFile = path.join(this.workerDir, `${feature.id}.status`);
       fs.writeFileSync(
@@ -547,6 +604,7 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
           featureId: feature.id,
           startedAt: new Date().toISOString(),
           status: "running",
+          hasAuth: !!this.sessionId,
         })
       );
 
@@ -645,6 +703,27 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
         if (fs.existsSync(logFile)) {
           const log = fs.readFileSync(logFile, "utf-8");
           const lastLines = log.split("\n").slice(-lines).join("\n");
+
+          // Check for authentication-specific errors
+          const authPatterns = [
+            /credit balance is too low/i,
+            /authentication failed/i,
+            /\bunauthorized\b/i
+          ];
+          if (authPatterns.some(pat => pat.test(lastLines))) {
+            return {
+              status: "crashed",
+              output: `Worker authentication failed.\n\n` +
+                      `This appears to be an authentication issue. Workers could not access Claude Code session.\n\n` +
+                      `Troubleshooting:\n` +
+                      `1. Ensure you're running claude-swarm from within Claude Code\n` +
+                      `2. Check that CLAUDE_CODE_SESSION_ID is set: echo $CLAUDE_CODE_SESSION_ID\n` +
+                      `3. Try re-authenticating: claude /logout && claude\n` +
+                      `4. Check worker logs at: ${logFile}\n\n` +
+                      `Last output:\n${this.truncateOutputLines(sanitizeOutput(lastLines, 500))}`,
+            };
+          }
+
           return {
             status: "crashed",
             output: `Worker session ended unexpectedly.\n\nLast output:\n${this.truncateOutputLines(sanitizeOutput(lastLines))}`,

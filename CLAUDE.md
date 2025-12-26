@@ -136,6 +136,58 @@ init.sh                           # Environment setup script (mode 0700)
 - **Node.js 18+** (ES2022 features required)
 - **tmux** for worker session management (`brew install tmux` on macOS)
 
+## Worker Authentication
+
+Workers authenticate using the parent Claude Code session. The orchestrator automatically:
+1. Captures `CLAUDE_CODE_SESSION_ID` from the environment
+2. Passes it to each tmux worker session
+3. Workers use this session ID to authenticate with Claude Code
+
+### Requirements
+
+- **MUST** run claude-swarm from within Claude Code (not standalone terminal)
+- Parent process must have active Claude Code authentication
+- Workers will fail with "Credit balance is too low" if session ID is missing
+
+### Environment Variables
+
+Workers inherit these Claude Code authentication environment variables:
+
+| Variable | Purpose | Example Value |
+|----------|---------|---------------|
+| `CLAUDE_CODE_SESSION_ID` | Session token for subscription-based authentication | `h0_abc123xyz...` |
+| `CLAUDE_CODE_ENTRYPOINT` | Tells Claude CLI this is running in CLI context (not web/app) | `cli` |
+| `CLAUDECODE` | Flag indicating we're running within Claude Code environment | `1` |
+
+**Session ID Format:** `h<version>_<token>` where version is a digit (e.g., `h0`, `h1`) and token is alphanumeric with dashes/underscores.
+
+**Note:** These environment variables are internal to Claude Code. Session IDs are captured at orchestrator startup and remain valid for the session duration (typically hours). If you see warnings about "unexpected format", the session ID may be corrupted or Claude Code's auth mechanism may have changed.
+
+### Troubleshooting Authentication Issues
+
+If workers crash with "Credit balance is too low":
+
+1. **Check you're in Claude Code:**
+   ```bash
+   echo $CLAUDE_CODE_SESSION_ID
+   # Should output: something like "h0_abc123..."
+   ```
+
+2. **Verify orchestrator captured session:**
+   Check worker logs in `.claude/orchestrator/workers/*.log`
+   Look for "Spawned with session ID: present"
+
+3. **Re-authenticate:**
+   ```bash
+   claude /logout
+   claude
+   ```
+
+4. **Check worker logs:**
+   ```bash
+   cat .claude/orchestrator/workers/<feature-id>.log
+   ```
+
 ## Debugging
 
 ```bash
