@@ -51,6 +51,8 @@ mkdir -p ~/.claude/skills/swarm && cp skill/SKILL.md ~/.claude/skills/swarm/
 
 ### Basic Usage
 
+**⚠️ Important:** claude-swarm MUST be run from within Claude Code, not a standalone terminal. Workers require access to your Claude Code session for authentication.
+
 Tell Claude to use the swarm:
 
 ```
