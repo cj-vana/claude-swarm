@@ -5293,14 +5293,16 @@ server.tool(
     projectDir: z.string().describe("Absolute path to the project directory"),
     skipConfigs: z.array(z.string()).optional().describe("Skip specific config types (e.g., ['dependabot', 'release-please'])"),
     force: z.boolean().optional().describe("Force overwrite existing files without merging (default: false)"),
+    platform: z.enum(["github", "gitlab", "gitea", "bitbucket", "azure"]).optional().describe("Override auto-detected Git platform"),
   },
-  async ({ projectDir, skipConfigs, force }) => {
+  async ({ projectDir, skipConfigs, force, platform }) => {
     const { state, workers } = await ensureInitialized(projectDir);
 
     // Create SetupManager with config
     const setupManager = new SetupManager(projectDir, {
       skipConfigs: skipConfigs || [],
       force: force || false,
+      platform,
     });
 
     // Analyze project

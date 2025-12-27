@@ -64,6 +64,8 @@ export interface SetupConfig {
   dryRun?: boolean;
   /** Custom threshold for freshness detection (default: 50) */
   freshnessThreshold?: number;
+  /** Override auto-detected Git platform */
+  platform?: Platform;
 }
 
 /**
@@ -211,8 +213,12 @@ export class SetupManager {
       return this.cachedAnalysis;
     }
 
-    // Detect the Git platform from remote origin
-    this.platform = await detectPlatform(this.projectDir);
+    // Use config platform if provided, otherwise detect from remote origin
+    if (this.config.platform) {
+      this.platform = this.config.platform;
+    } else {
+      this.platform = await detectPlatform(this.projectDir);
+    }
     this.platformConfig = getPlatformConfig(this.platform);
 
     this.cachedAnalysis = await analyzeProjectForSetup(this.projectDir);
