@@ -678,14 +678,15 @@ export async function startDashboardServer(
     // Start SSE polling if not already running
     startSSEPolling();
 
-    // Send heartbeat every 30 seconds to keep connection alive
+    // Send heartbeat every 15 seconds to keep connection alive
+    // (15s is a good balance - browsers typically timeout at 45-60s)
     const heartbeatInterval = setInterval(() => {
       try {
         res.write(`event: heartbeat\ndata: ${JSON.stringify({ timestamp: new Date().toISOString() })}\n\n`);
       } catch (err) {
         clearInterval(heartbeatInterval);
       }
-    }, 30000);
+    }, 15000);
 
     // Handle client disconnect
     req.on("close", () => {

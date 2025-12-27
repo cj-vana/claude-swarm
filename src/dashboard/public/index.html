@@ -621,8 +621,9 @@
         // Fetch all data from API
         async function fetchData() {
             try {
-                const [statusRes, statsRes, logsRes] = await Promise.all([
+                const [statusRes, featuresRes, statsRes, logsRes] = await Promise.all([
                     fetch(`${API_BASE}/status`).catch(() => null),
+                    fetch(`${API_BASE}/features`).catch(() => null),
                     fetch(`${API_BASE}/stats`).catch(() => null),
                     fetch(`${API_BASE}/logs`).catch(() => null)
                 ]);
@@ -634,26 +635,38 @@
                     document.getElementById('project-path').textContent = status.projectDir || 'No project loaded';
                     updateStatusBadge(status.status || 'not_started');
                     sessionStartTime = status.startTime;
-
-                    // Update features map for SSE sync
-                    if (status.features) {
-                        features.clear();
-                        for (const f of status.features) {
-                            features.set(f.id, f);
-                        }
-                    }
-
-                    updateProgress(status.features);
-                    updateFeatures(status.features);
-                    updateWorkers(status.features);
                 } else {
                     updateStatusBadge('not_started');
                     document.getElementById('project-path').textContent = 'Unable to connect to API';
                 }
 
-                // Handle stats response
+                // Handle features response - this is critical for displaying features
+                if (featuresRes && featuresRes.ok) {
+                    const featuresData = await featuresRes.json();
+                    const featureList = featuresData.features || [];
+
+                    // Update features map for SSE sync
+                    features.clear();
+                    for (const f of featureList) {
+                        features.set(f.id, f);
+                    }
+
+                    updateProgress(featureList);
+                    updateFeatures(featureList);
+                    updateWorkers(featureList);
+                }
+
+                // Handle stats response - map API structure to frontend expectations
                 if (statsRes && statsRes.ok) {
-                    const stats = await statsRes.json();
+                    const statsData = await statsRes.json();
+                    // Map the API response structure to what updateStats expects
+                    const stats = statsData.stats ? {
+                        successRate: (statsData.stats.success?.rate || 0) * 100,
+                        avgCompletionTime: statsData.stats.time?.avgCompletionTimeMs || 0,
+                        totalAttempts: statsData.stats.attempts?.total || 0,
+                        totalRetries: Math.max(0, (statsData.stats.attempts?.total || 0) - (statsData.stats.success?.total || 0)),
+                        maxConcurrentWorkers: 0 // Not tracked in current API
+                    } : null;
                     updateStats(stats);
                 }
 
@@ -705,35 +718,64 @@
             }
         }
 
+        // Track SSE reconnection attempts
+        let sseReconnectAttempts = 0;
+        const SSE_MAX_RECONNECT_ATTEMPTS = 10;
+        const SSE_RECONNECT_DELAY_BASE = 1000; // Start with 1 second
+        let sseReconnectTimeout = null;
+
         // Connect to Server-Sent Events
         function connectSSE() {
-            if (eventSource) {
-                eventSource.close();
+            // Clear any pending reconnect timeout
+            if (sseReconnectTimeout) {
+                clearTimeout(sseReconnectTimeout);
+                sseReconnectTimeout = null;
             }
 
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+
+            console.log('Connecting to SSE...');
             eventSource = new EventSource(`${API_BASE}/events`);
 
             eventSource.onopen = () => {
                 console.log('SSE connected');
+                sseReconnectAttempts = 0; // Reset reconnect attempts on successful connection
                 document.getElementById('refresh-status').textContent = 'Live (SSE)';
-                document.getElementById('refresh-status').className = 'text-green-400';
+                document.getElementById('refresh-status').className = 'text-green-500 dark:text-green-400';
                 stopAutoRefresh(); // Stop polling when SSE is connected
             };
 
             eventSource.onerror = (error) => {
-                console.error('SSE error:', error);
-                document.getElementById('refresh-status').textContent = 'Reconnecting...';
-                document.getElementById('refresh-status').className = 'text-yellow-400';
+                console.error('SSE error:', error, 'readyState:', eventSource?.readyState);
 
-                // If SSE fails, fall back to polling
-                if (eventSource.readyState === EventSource.CLOSED) {
-                    useSSE = false;
+                // Handle connection loss
+                if (!eventSource || eventSource.readyState === EventSource.CLOSED) {
+                    document.getElementById('refresh-status').textContent = 'Reconnecting...';
+                    document.getElementById('refresh-status').className = 'text-yellow-500 dark:text-yellow-400';
+
+                    // Start polling as fallback immediately
                     startAutoRefresh();
-                    // Try to reconnect SSE after a delay
-                    setTimeout(() => {
-                        useSSE = true;
-                        connectSSE();
-                    }, 5000);
+
+                    // Attempt to reconnect with exponential backoff
+                    if (sseReconnectAttempts < SSE_MAX_RECONNECT_ATTEMPTS) {
+                        const delay = SSE_RECONNECT_DELAY_BASE * Math.pow(2, sseReconnectAttempts);
+                        sseReconnectAttempts++;
+                        console.log(`SSE reconnecting in ${delay}ms (attempt ${sseReconnectAttempts}/${SSE_MAX_RECONNECT_ATTEMPTS})`);
+
+                        sseReconnectTimeout = setTimeout(() => {
+                            connectSSE();
+                        }, delay);
+                    } else {
+                        console.log('SSE max reconnect attempts reached, using polling only');
+                        document.getElementById('refresh-status').textContent = 'Polling';
+                        document.getElementById('refresh-status').className = 'text-blue-500 dark:text-blue-400';
+                    }
+                } else if (eventSource.readyState === EventSource.CONNECTING) {
+                    document.getElementById('refresh-status').textContent = 'Connecting...';
+                    document.getElementById('refresh-status').className = 'text-yellow-500 dark:text-yellow-400';
                 }
             };
 
@@ -741,6 +783,8 @@
             eventSource.addEventListener('connected', (e) => {
                 const data = JSON.parse(e.data);
                 console.log('SSE connected with client ID:', data.clientId);
+                // Refresh data immediately after SSE connects to ensure we have the latest state
+                fetchData();
             });
 
             // Handle status updates
@@ -798,9 +842,12 @@
                 updateWorkers(featureArray);
             });
 
-            // Handle heartbeat
+            // Handle heartbeat - reset reconnect counter as connection is healthy
             eventSource.addEventListener('heartbeat', (e) => {
                 console.log('SSE heartbeat received');
+                sseReconnectAttempts = 0; // Reset reconnect counter on successful heartbeat
+                document.getElementById('refresh-status').textContent = 'Live (SSE)';
+                document.getElementById('refresh-status').className = 'text-green-500 dark:text-green-400';
             });
         }
 
@@ -820,6 +867,11 @@
 
         // Disconnect SSE
         function disconnectSSE() {
+            // Clear any pending reconnect timeout
+            if (sseReconnectTimeout) {
+                clearTimeout(sseReconnectTimeout);
+                sseReconnectTimeout = null;
+            }
             if (eventSource) {
                 eventSource.close();
                 eventSource = null;
