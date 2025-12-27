@@ -539,11 +539,14 @@ export async function startDashboardServer(
             res.end();
           }
         } catch (error: any) {
+          // Stop interval on persistent errors to prevent infinite error loops
           res.write(`event: error\ndata: ${JSON.stringify({
             type: reviewType,
             error: error.message,
             timestamp: new Date().toISOString(),
           })}\n\n`);
+          if (outputInterval) clearInterval(outputInterval);
+          res.end();
         }
       };
 
@@ -651,11 +654,14 @@ export async function startDashboardServer(
             res.end();
           }
         } catch (error: any) {
+          // Stop interval on persistent errors to prevent infinite error loops
           res.write(`event: error\ndata: ${JSON.stringify({
             featureId,
             error: error.message,
             timestamp: new Date().toISOString(),
           })}\n\n`);
+          if (outputInterval) clearInterval(outputInterval);
+          res.end();
         }
       };
 

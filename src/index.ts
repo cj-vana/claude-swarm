@@ -5359,8 +5359,10 @@ server.tool(
       response += `Found ${allIssues.length} total issues, ${eligibleIssues.length} at ${minSeverity} or higher.\n\n`;
 
       for (const issue of eligibleIssues) {
-        const icon = issue.severity === "error" ? "🔴" :
-          issue.severity === "warning" ? "🟡" : "🔵";
+        const sev = normalizeSeverity(issue.severity);
+        const icon =
+          sev === "critical" || sev === "major" || sev === "error" ? "🔴" :
+          sev === "moderate" || sev === "warning" ? "🟡" : "🔵";
         response += `**[${issue.index}]** ${icon} [${issue.source}/${issue.category}] ${issue.message}\n`;
         if (issue.file) response += `   File: ${issue.file}${issue.line ? `:${issue.line}` : ""}\n`;
         if (issue.suggestion) response += `   Fix: ${issue.suggestion}\n`;
@@ -5412,10 +5414,22 @@ server.tool(
 
     // Create features for each group
     const newFeatures: Feature[] = [];
-    const existingFeatureCount = current.features.length;
+
+    // Generate unique feature IDs by scanning existing IDs
+    const existingIds = new Set(current.features.map((f) => f.id));
+    const nextFixId = (() => {
+      let n = 1;
+      return () => {
+        while (existingIds.has(`fix-${n}`)) n++;
+        const id = `fix-${n}`;
+        existingIds.add(id);
+        n++;
+        return id;
+      };
+    })();
 
     for (const [key, issues] of featureGroups) {
-      const featureId = `fix-${existingFeatureCount + newFeatures.length + 1}`;
+      const featureId = nextFixId();
 
       // Build description from issues
       let description: string;
