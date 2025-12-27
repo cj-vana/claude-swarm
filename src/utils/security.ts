@@ -351,6 +351,8 @@ export const FeatureSchema = z.object({
   context: FeatureContextSchema.optional(),
   protocolBindings: z.array(ProtocolBindingSchema).optional(),
   routing: RoutingConfigSchema.optional(),
+  // Files modified by this feature's worker
+  modifiedFiles: z.array(z.string()).optional(),
 });
 
 /**
@@ -369,6 +371,14 @@ export const ConfidenceAlertSchema = z.object({
 export const ConfidenceConfigSchema = z.object({
   threshold: z.number().min(0).max(100),
   autoAlert: z.boolean(),
+});
+
+/**
+ * Zod schema for verification config
+ */
+export const VerificationConfigSchema = z.object({
+  commands: z.array(z.string().max(500)),
+  failOnError: z.boolean(),
 });
 
 /**
@@ -414,6 +424,7 @@ export const ReviewConfigSchema = z.object({
   skipOnFailure: z.boolean(),
   codeReviewEnabled: z.boolean(),
   architectureReviewEnabled: z.boolean(),
+  autoTrigger: z.boolean().optional(), // Optional for backwards compatibility
 });
 
 /**
@@ -460,4 +471,6 @@ export const OrchestratorStateSchema = z.object({
   reviewConfig: ReviewConfigSchema.optional(),
   reviewWorkers: z.array(ReviewWorkerSchema).optional(),
   aggregatedReview: AggregatedReviewSchema.optional(),
+  // Pre-completion verification
+  verificationConfig: VerificationConfigSchema.optional(),
 });

@@ -199,3 +199,84 @@ When adding a new repository configuration type:
 3. Add prompt builder method in `src/setup/manager.ts`
 4. Add switch case in `generatePromptForFeature()`
 5. Update `GeneratedFiles` type if adding a new file category
+
+## Parallel Worker Limitations
+
+Workers run in isolated tmux sessions and cannot see each other's changes until they commit. This creates potential conflicts:
+
+### Conflict Scenarios
+- **Same file edits**: Two workers modifying the same file will cause merge conflicts
+- **Type definition changes**: One worker changing types that another depends on
+- **Shared dependencies**: Both workers updating package.json or lock files
+- **Import paths**: Renaming/moving files that other workers import
+
+### Conflict Detection
+Use `validate_workers` before `start_parallel_workers` to detect potential conflicts:
+- Analyzes feature descriptions for file/folder/component overlap
+- Identifies dangerous action combinations (refactor + refactor)
+- Provides safe parallel groups vs. sequential recommendations
+
+### Mitigation Strategies
+1. **Feature Ordering**: Use `set_dependencies` to explicitly order features
+2. **Sequential Execution**: Run conflicting features one at a time
+3. **Verification Commands**: Use `configure_verification` to run `npx tsc --noEmit` to catch type errors
+4. **Review Workers**: Post-completion reviews detect merge conflicts and type inconsistencies
+5. **Small Features**: Break large features into smaller, non-overlapping units
+
+### Best Practices
+```bash
+# Before starting parallel workers, always validate
+# Tool: validate_workers with featureIds
+
+# Configure verification to catch type errors early
+# Tool: configure_verification with commands: ["npx tsc --noEmit"]
+
+# Group independent features (UI vs backend vs config)
+# Run overlapping features sequentially with dependencies
+```
+
+## Feature Rollback
+
+The orchestrator creates git snapshot branches before each worker starts, enabling safe rollback of failed features.
+
+### How Rollback Works
+
+1. **Snapshot Creation**: When `start_worker` is called, a `swarm/{featureId}` branch is created at current HEAD
+2. **Worker Execution**: The worker makes changes to the working directory
+3. **Completion Handling**:
+   - On success: `mark_complete` deletes the snapshot branch (no longer needed)
+   - On failure: The snapshot branch is preserved for potential rollback
+
+### Using Rollback
+
+```bash
+# Rollback all files changed by a failed feature
+# Tool: rollback_feature with featureId: "feature-1"
+
+# Rollback specific files only
+# Tool: rollback_feature with featureId: "feature-1", files: ["src/component.ts"]
+```
+
+### Rollback Behavior
+
+- **Modified files**: Restored to their state before the worker started
+- **New files**: Removed (files that didn't exist in the snapshot)
+- **Deleted files**: Restored (files that existed in snapshot but were deleted)
+
+### Race Condition Warning
+
+When rolling back a feature in a parallel worker environment:
+- If other workers modified the same files, their changes will also be reverted
+- Always run `validate_workers` to check for file conflicts before rollback
+- Consider using specific file list for targeted rollback to minimize side effects
+
+### Snapshot Branch Cleanup
+
+Snapshot branches are automatically cleaned up:
+- On successful feature completion (`mark_complete` with `success: true`)
+- During session reset (`orchestrator_reset`)
+
+To manually check for leftover branches:
+```bash
+git branch --list 'swarm/*'
+```
