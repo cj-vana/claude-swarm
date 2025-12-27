@@ -41,6 +41,7 @@ import { getNetworkingManager, ProtocolNetworkingManager, ConflictStrategy as Ne
 import { getProposalManager, ProposalManager, type ProtocolProposal } from "./protocols/proposal-manager.js";
 import { getBaseConstraints } from "./protocols/base-constraints.js";
 import type { BaseConstraints } from "./protocols/schema.js";
+import { SetupManager } from "./setup/manager.js";
 
 // Dashboard configuration from environment variables
 const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT || "3456", 10);
@@ -5197,6 +5198,325 @@ server.tool(
     response += `- **Skip on feature failure**: ${newConfig.skipOnFailure ? "Yes" : "No"}\n`;
     response += `- **Code review**: ${newConfig.codeReviewEnabled ? "Enabled" : "Disabled"}\n`;
     response += `- **Architecture review**: ${newConfig.architectureReviewEnabled ? "Enabled" : "Disabled"}\n`;
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: setup_analyze
+// ============================================================================
+server.tool(
+  "setup_analyze",
+  "Analyze a repository to detect freshness (how much setup is needed) and identify missing configurations. Use this to understand what setup work is needed before running setup_init.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+  },
+  async ({ projectDir }) => {
+    // Validate project directory
+    const validatedDir = validateProjectDir(projectDir);
+
+    const setupManager = new SetupManager(validatedDir);
+
+    // Detect freshness and analyze project
+    const [freshness, analysis] = await Promise.all([
+      setupManager.detectFreshness(),
+      setupManager.analyzeProject(),
+    ]);
+
+    // Generate potential setup features
+    const features = setupManager.generateSetupFeatures(analysis);
+    const missingConfigs = features.filter(f => !f.existingFile && !f.skip);
+
+    let response = `## Repository Analysis\n\n`;
+
+    // Freshness section
+    response += `### Freshness Score: ${freshness.score}/100\n`;
+    response += freshness.isFresh
+      ? `This repository appears to need initial setup.\n\n`
+      : `This repository appears to be already configured.\n\n`;
+
+    response += `**Freshness Checks:**\n`;
+    for (const check of freshness.checks) {
+      const icon = check.missing ? "✗" : "✓";
+      response += `- [${icon}] ${check.name} (${check.points}/${check.maxPoints} points)\n`;
+    }
+    response += `\n`;
+
+    // Project info section
+    response += `### Project Information\n`;
+    response += `- **Type**: ${analysis.projectInfo.type}\n`;
+    response += `- **Package Manager**: ${analysis.projectInfo.packageManager || "unknown"}\n`;
+    response += `- **Has Tests**: ${analysis.ciNeeds.test ? "Yes" : "No"}\n`;
+    response += `- **Has Build**: ${analysis.ciNeeds.build ? "Yes" : "No"}\n`;
+    response += `- **Has Linting**: ${analysis.ciNeeds.lint ? "Yes" : "No"}\n`;
+    response += `- **Is Monorepo**: ${analysis.sourceStructure.isMonorepo ? "Yes" : "No"}\n\n`;
+
+    // Missing configs section
+    response += `### Missing Configurations\n`;
+    if (missingConfigs.length === 0) {
+      response += `All standard configurations are present.\n`;
+    } else {
+      for (const config of missingConfigs) {
+        response += `- **${config.id}**: ${config.description}\n`;
+        response += `  Target: \`${config.targetPath}\`\n`;
+      }
+    }
+    response += `\n`;
+
+    // Recommendations
+    response += `### Recommendations\n`;
+    if (freshness.isFresh && missingConfigs.length > 0) {
+      response += `Run \`setup_init\` to start the automated setup process.\n`;
+      response += `This will create ${missingConfigs.length} configuration file(s).\n`;
+    } else if (missingConfigs.length > 0) {
+      response += `Some configurations are missing. Run \`setup_init\` to add them.\n`;
+    } else {
+      response += `No setup action needed. Repository is fully configured.\n`;
+    }
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: setup_init
+// ============================================================================
+server.tool(
+  "setup_init",
+  "Initialize repository setup by creating features for missing configurations and starting workers to implement them. This runs as a swarm with workers for CLAUDE.md, GitHub Actions CI, Dependabot, Release Please, and issue templates.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    skipConfigs: z.array(z.string()).optional().describe("Skip specific config types (e.g., ['dependabot', 'release-please'])"),
+    force: z.boolean().optional().describe("Force overwrite existing files without merging (default: false)"),
+  },
+  async ({ projectDir, skipConfigs, force }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
+
+    // Create SetupManager with config
+    const setupManager = new SetupManager(projectDir, {
+      skipConfigs: skipConfigs || [],
+      force: force || false,
+    });
+
+    // Analyze project
+    const analysis = await setupManager.analyzeProject();
+    const setupFeatures = setupManager.generateSetupFeatures(analysis);
+
+    // Filter to only features that need work
+    const featuresToCreate = setupFeatures.filter(f => !f.skip && (!f.existingFile || force));
+
+    if (featuresToCreate.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `No setup work needed! All configurations are already present.\n\nUse \`setup_analyze\` to see the current state, or use \`force: true\` to regenerate existing files.`,
+          },
+        ],
+      };
+    }
+
+    // Check for existing session
+    const existing = state.load();
+    if (existing && existing.status === "in_progress") {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `An orchestration session is already in progress.\n\nUse \`orchestrator_status\` to check current progress, or \`orchestrator_reset\` to start fresh before running setup.`,
+          },
+        ],
+      };
+    }
+
+    // Convert setup features to orchestrator features
+    const orchestratorFeatures: Feature[] = featuresToCreate.map((sf, i) => ({
+      id: sf.id,
+      description: sf.description,
+      status: "pending" as const,
+      attempts: 0,
+      dependsOn: sf.dependsOn,
+    }));
+
+    // Initialize orchestration state
+    const newState: OrchestratorState = {
+      projectDir,
+      taskDescription: `Repository setup: Configure ${featuresToCreate.length} files including ${featuresToCreate.map(f => f.targetPath).join(", ")}`,
+      features: orchestratorFeatures,
+      workers: [],
+      status: "in_progress",
+      startTime: new Date().toISOString(),
+      lastUpdated: new Date().toISOString(),
+      progressLog: [`[${new Date().toISOString()}] Setup initialized with ${orchestratorFeatures.length} configuration tasks`],
+    };
+
+    state.save(newState);
+    state.writeProgressFile();
+
+    // Initialize setup state
+    setupManager.initializeSetup();
+
+    // Start workers for features without dependencies
+    const startableFeatures = orchestratorFeatures.filter(f => !f.dependsOn || f.dependsOn.length === 0);
+    const startedWorkers: string[] = [];
+
+    for (const feature of startableFeatures.slice(0, 3)) { // Start up to 3 workers in parallel
+      // Build the setup prompt
+      const prompt = setupManager.buildSetupPrompt(feature.id, analysis);
+
+      // Start the worker
+      const result = await workers.startWorker(feature, prompt);
+
+      if (result.success) {
+        feature.status = "in_progress";
+        feature.attempts++;
+        feature.workerId = result.sessionName;
+        feature.startedAt = new Date().toISOString();
+        startedWorkers.push(`${feature.id} (${result.sessionName})`);
+
+        newState.progressLog.push(`[${new Date().toISOString()}] Started setup worker for ${feature.id}`);
+      }
+    }
+
+    state.save(newState);
+    state.writeProgressFile();
+
+    let response = `## Repository Setup Initialized\n\n`;
+    response += `**Project**: ${projectDir}\n`;
+    response += `**Features**: ${orchestratorFeatures.length} configuration tasks\n\n`;
+
+    response += `### Tasks to Create:\n`;
+    for (const feature of orchestratorFeatures) {
+      const icon = feature.status === "in_progress" ? "🔄" : "⏳";
+      response += `${icon} ${feature.id}: ${feature.description}\n`;
+    }
+    response += `\n`;
+
+    response += `### Workers Started:\n`;
+    if (startedWorkers.length > 0) {
+      for (const worker of startedWorkers) {
+        response += `- ${worker}\n`;
+      }
+      response += `\n`;
+      response += `Use \`setup_status\` to monitor progress.\n`;
+      response += `Use \`check_worker\` to view individual worker output.\n`;
+    } else {
+      response += `No workers started yet. Use \`start_worker\` to begin.\n`;
+    }
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: setup_status
+// ============================================================================
+server.tool(
+  "setup_status",
+  "Check the progress of a repository setup operation. Shows which setup tasks are completed, in progress, or pending.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+  },
+  async ({ projectDir }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
+
+    const setupManager = new SetupManager(projectDir);
+    const setupStatus = await setupManager.getSetupStatus();
+
+    if (!setupStatus.initialized) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `No setup in progress.\n\nUse \`setup_analyze\` to check repository freshness, then \`setup_init\` to start setup.`,
+          },
+        ],
+      };
+    }
+
+    // Also get orchestrator state for worker info
+    const current = state.load();
+
+    let response = `## Setup Progress: ${setupStatus.progressPercent}%\n\n`;
+
+    // Summary
+    const completed = setupStatus.completedFeatures.length;
+    const pending = setupStatus.pendingFeatures.length;
+    const failed = setupStatus.failedFeatures.length;
+    const total = completed + pending + failed;
+
+    response += `**Progress**: ${completed}/${total} tasks completed\n`;
+    if (failed > 0) {
+      response += `**Failed**: ${failed} task(s) need attention\n`;
+    }
+    response += `\n`;
+
+    // Completed tasks
+    if (setupStatus.completedFeatures.length > 0) {
+      response += `### Completed\n`;
+      for (const featureId of setupStatus.completedFeatures) {
+        const feature = setupStatus.features.find(f => f.id === featureId);
+        response += `- ✅ ${featureId}: ${feature?.targetPath || ""}\n`;
+      }
+      response += `\n`;
+    }
+
+    // In progress tasks
+    const inProgressFeatures = current?.features.filter(f => f.status === "in_progress") || [];
+    if (inProgressFeatures.length > 0) {
+      response += `### In Progress\n`;
+      for (const feature of inProgressFeatures) {
+        response += `- 🔄 ${feature.id}`;
+        if (feature.workerId) {
+          response += ` (worker: ${feature.workerId})`;
+        }
+        response += `\n`;
+      }
+      response += `\n`;
+    }
+
+    // Pending tasks
+    if (setupStatus.pendingFeatures.length > 0) {
+      response += `### Pending\n`;
+      for (const featureId of setupStatus.pendingFeatures) {
+        const feature = setupStatus.features.find(f => f.id === featureId);
+        const deps = feature?.dependsOn || [];
+        response += `- ⏳ ${featureId}: ${feature?.targetPath || ""}`;
+        if (deps.length > 0) {
+          response += ` (depends on: ${deps.join(", ")})`;
+        }
+        response += `\n`;
+      }
+      response += `\n`;
+    }
+
+    // Failed tasks
+    if (setupStatus.failedFeatures.length > 0) {
+      response += `### Failed\n`;
+      for (const featureId of setupStatus.failedFeatures) {
+        const feature = setupStatus.features.find(f => f.id === featureId);
+        response += `- ❌ ${featureId}: ${feature?.targetPath || ""}\n`;
+      }
+      response += `\n`;
+      response += `Use \`retry_feature\` to retry failed tasks.\n`;
+    }
+
+    // Next steps
+    response += `### Next Steps\n`;
+    if (pending === 0 && failed === 0) {
+      response += `Setup complete! All configurations have been created.\n`;
+    } else if (inProgressFeatures.length > 0) {
+      response += `Wait for in-progress workers to complete, then use \`mark_complete\` to update status.\n`;
+    } else if (pending > 0) {
+      response += `Use \`start_worker\` to start the next pending task.\n`;
+    }
 
     return {
       content: [{ type: "text", text: response }],
