@@ -106,6 +106,9 @@ export interface Feature {
   };
   protocolBindings?: ProtocolBinding[]; // Protocols bound to this feature
   routing?: RoutingConfig; // Routing configuration for worker assignment
+
+  // Files modified by this feature's worker
+  modifiedFiles?: string[];
 }
 
 export interface WorkerStatus {
@@ -162,6 +165,7 @@ export interface ReviewConfig {
   skipOnFailure: boolean; // Skip review if any features failed
   codeReviewEnabled: boolean; // Enable code quality review
   architectureReviewEnabled: boolean; // Enable architecture review
+  autoTrigger: boolean; // Automatically trigger reviews when all features complete (default: true)
 }
 
 /**
@@ -173,6 +177,15 @@ export interface AggregatedReview {
   codeReview?: ReviewFindings;
   architectureReview?: ReviewFindings;
   overallAssessment: string;
+}
+
+/**
+ * VerificationConfig - Commands workers must run before completing
+ * These commands are injected into worker prompts to ensure code quality
+ */
+export interface VerificationConfig {
+  commands: string[]; // Commands to run before completion (e.g., ['npm run build', 'npx tsc --noEmit'])
+  failOnError: boolean; // Whether to fail the feature if verification fails
 }
 
 export interface OrchestratorState {
@@ -199,6 +212,9 @@ export interface OrchestratorState {
   reviewConfig?: ReviewConfig;
   reviewWorkers?: ReviewWorker[];
   aggregatedReview?: AggregatedReview;
+
+  // Pre-completion verification
+  verificationConfig?: VerificationConfig;
 }
 
 // Maximum number of log entries to keep (prevents unbounded growth)

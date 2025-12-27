@@ -13,6 +13,7 @@
 import express, { Request, Response, NextFunction } from "express";
 import * as http from "http";
 import * as path from "path";
+import * as fs from "fs";
 import { fileURLToPath } from "url";
 import { StateManager, OrchestratorState, Feature, WorkerStatus, ReviewWorker } from "../state/manager.js";
 import { WorkerManager } from "../workers/manager.js";
@@ -66,13 +67,18 @@ export async function startDashboardServer(
   const sseClients: SSEClient[] = [];
   let lastSnapshot: StateSnapshot | null = null;
   let ssePollingInterval: NodeJS.Timeout | null = null;
+  let globalSequence = 0; // Global sequence counter for SSE events
 
   // Generate unique client ID
   const generateClientId = () => `client-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-  // Send SSE event to all connected clients
+  // Send SSE event to all connected clients with sequence number
   const broadcastSSE = (eventType: string, data: unknown) => {
-    const message = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+    globalSequence++;
+    const eventData = typeof data === "object" && data !== null
+      ? { ...data, _seq: globalSequence }
+      : { value: data, _seq: globalSequence };
+    const message = `id: ${globalSequence}\nevent: ${eventType}\ndata: ${JSON.stringify(eventData)}\n\n`;
     sseClients.forEach((client) => {
       try {
         client.res.write(message);
@@ -196,6 +202,7 @@ export async function startDashboardServer(
             completedAt: rw.completedAt,
             findingsSeverity: rw.findings?.severity,
             findingsIssueCount: rw.findings?.issues?.length || 0,
+            findings: rw.findings || null, // Include full findings for completed reviews
           });
         }
       }
@@ -604,11 +611,46 @@ export async function startDashboardServer(
         return;
       }
 
-      // Check if feature has an active worker
-      if (!feature.workerId) {
+      // Check if feature has an active worker or historical log
+      const logFile = path.join(state.projectDir, ".claude", "orchestrator", "workers", `${featureId}.log`);
+      const hasLogFile = fs.existsSync(logFile);
+
+      if (!feature.workerId && !hasLogFile) {
         res.status(404).json({
-          error: `No active worker for feature: ${featureId}`,
+          error: `No active worker or historical output for feature: ${featureId}`,
         });
+        return;
+      }
+
+      // If no active worker but log file exists, serve historical output
+      if (!feature.workerId && hasLogFile) {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        res.setHeader("X-Accel-Buffering", "no");
+        res.flushHeaders();
+
+        try {
+          const logContent = fs.readFileSync(logFile, "utf-8");
+          res.write(`event: output\ndata: ${JSON.stringify({
+            featureId,
+            output: logContent,
+            historical: true,
+            timestamp: new Date().toISOString(),
+          })}\n\n`);
+          res.write(`event: ended\ndata: ${JSON.stringify({
+            featureId,
+            message: "Worker completed - showing historical output",
+            timestamp: new Date().toISOString(),
+          })}\n\n`);
+        } catch (readError: any) {
+          res.write(`event: error\ndata: ${JSON.stringify({
+            featureId,
+            error: `Failed to read log file: ${readError.message}`,
+            timestamp: new Date().toISOString(),
+          })}\n\n`);
+        }
+        res.end();
         return;
       }
 

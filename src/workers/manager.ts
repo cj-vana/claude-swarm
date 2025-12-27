@@ -204,7 +204,9 @@ ${projectContext}
    - Commit your changes following conventional commit format:
      * Use: feat(scope), fix(scope), docs(scope), refactor(scope), test(scope)
      * Example: "feat(auth): add user authentication system"
-     * Add footer: "🤖 Committed by claude-swarm worker ${feature.id}"
+     * Add footer: "🤖 Committed by claude-swarm worker ${feature.id}"${state?.verificationConfig?.commands?.length ? `
+   - Run the following verification commands and ensure they pass:
+${state.verificationConfig.commands.map((cmd) => `     * \`${cmd}\``).join("\n")}${state.verificationConfig.failOnError ? "\n     * If any verification command fails, fix the issue before proceeding" : ""}` : ""}
    - Create a file at: .claude/orchestrator/workers/${feature.id}.done
      with a brief summary of what you implemented
 
@@ -495,6 +497,13 @@ echo 'PLANNER_EXITED' >> ${shellQuote(logFile)}
 
     const sessionName = this.generateSessionName(feature.id);
     const prompt = this.buildWorkerPrompt(feature, customPrompt);
+
+    // Create snapshot branch for rollback capability
+    const snapshotResult = await this.createSnapshotBranch(feature.id);
+    // Note: We don't fail if snapshot creation fails - just log it
+    if (!snapshotResult.success) {
+      console.log(`Note: Could not create snapshot branch for ${feature.id}: ${snapshotResult.error}`);
+    }
 
     // Check if tmux is available
     try {
@@ -903,6 +912,198 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
   }
 
   /**
+   * Get modified files for a feature using git diff against snapshot branch.
+   * This is the authoritative source - uses git to compare current HEAD with
+   * the snapshot branch created before the worker started.
+   * Falls back to log parsing if snapshot branch doesn't exist.
+   *
+   * @param featureId - The feature ID to check
+   * @returns Promise resolving to array of file paths modified since the worker started
+   */
+  async getModifiedFilesForFeature(featureId: string): Promise<string[]> {
+    const branchName = `swarm/${featureId}`;
+
+    // Try git-based tracking first (authoritative)
+    try {
+      const { stdout } = await execFileAsync(
+        "git", ["diff", "--name-only", branchName, "HEAD"],
+        { cwd: this.projectDir }
+      );
+      const files = stdout.trim().split("\n").filter((f: string) => f && f.length > 0);
+      if (files.length > 0) {
+        return files;
+      }
+    } catch {
+      // Snapshot branch doesn't exist or not a git repo - fall back to log parsing
+    }
+
+    // Fallback: parse worker log for file modifications
+    return this.parseLogForModifiedFiles(featureId);
+  }
+
+  /**
+   * Parse worker log to extract modified files (fallback method)
+   * Used when git-based tracking is unavailable (no snapshot branch)
+   *
+   * @param featureId - The feature ID whose log to parse
+   * @returns Array of file paths found in the log
+   */
+  private parseLogForModifiedFiles(featureId: string): string[] {
+    const logFile = path.join(this.workerDir, `${featureId}.log`);
+    const filesModified = new Set<string>();
+
+    if (fs.existsSync(logFile)) {
+      try {
+        const log = fs.readFileSync(logFile, "utf-8");
+        const lines = log.split("\n");
+
+        for (const line of lines) {
+          // Match file paths in tool output (Writing, Editing, Created - not Reading)
+          const fileMatch = line.match(
+            /(?:Writing|Editing|Created|Modified|file_path['":\s]+)([^\s'"]+\.[a-zA-Z]{1,10})/i
+          );
+          if (fileMatch) {
+            filesModified.add(fileMatch[1]);
+          }
+
+          // Also match absolute paths
+          const pathMatch = line.match(
+            /\/[\w\-\/]+\.[a-zA-Z]{1,10}\b/
+          );
+          if (pathMatch) {
+            filesModified.add(pathMatch[0]);
+          }
+        }
+      } catch {
+        // Ignore read errors
+      }
+    }
+
+    return Array.from(filesModified);
+  }
+
+  /**
+   * Get all modified files across all feature workers using git-based tracking.
+   * Compares each swarm/* snapshot branch against HEAD to find all files
+   * modified during the session. Falls back to parsing all worker logs
+   * if git-based tracking is unavailable.
+   *
+   * @returns Array of unique file paths modified across all features
+   */
+  async getAllModifiedFiles(): Promise<string[]> {
+    const modifiedFiles = new Set<string>();
+
+    // Try git-based tracking first (authoritative)
+    try {
+      const { execSync } = await import("child_process");
+
+      // Get all swarm/* branches
+      const branchOutput = execSync("git branch --list swarm/*", {
+        cwd: this.projectDir,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      const branches = branchOutput
+        .split("\n")
+        .map((b) => b.trim().replace(/^\*\s*/, ""))
+        .filter((b) => b && b.length > 0 && b.startsWith("swarm/"));
+
+      // Get files changed between each branch and HEAD
+      for (const branch of branches) {
+        try {
+          const diffOutput = execSync(`git diff --name-only ${branch} HEAD`, {
+            cwd: this.projectDir,
+            encoding: "utf-8",
+            stdio: ["pipe", "pipe", "pipe"],
+          });
+          const files = diffOutput.trim().split("\n").filter((f) => f);
+          files.forEach((f) => modifiedFiles.add(f));
+        } catch {
+          // Ignore individual branch diff failures
+        }
+      }
+
+      if (modifiedFiles.size > 0) {
+        return Array.from(modifiedFiles);
+      }
+    } catch {
+      // Not a git repo or git not available - fall back to log parsing
+    }
+
+    // Fallback: parse all worker logs for file modifications
+    return this.parseAllLogsForModifiedFiles();
+  }
+
+  /**
+   * Parse all worker logs to extract modified files (fallback method).
+   * Used when git-based tracking is unavailable.
+   *
+   * @returns Array of unique file paths found across all worker logs
+   */
+  private parseAllLogsForModifiedFiles(): string[] {
+    const modifiedFiles = new Set<string>();
+
+    try {
+      if (!fs.existsSync(this.workerDir)) {
+        return [];
+      }
+
+      const files = fs.readdirSync(this.workerDir);
+      const logFiles = files.filter((f) => f.endsWith(".log"));
+
+      for (const logFile of logFiles) {
+        try {
+          const content = fs.readFileSync(
+            path.join(this.workerDir, logFile),
+            "utf-8"
+          );
+
+          // Extract file paths from Write tool calls
+          const writeMatches = content.matchAll(
+            /(?:Write|Writing)\s+(?:to\s+)?(?:file\s+)?['":']?\s*([^\s'":\n]+\.[a-zA-Z]{1,10})/gi
+          );
+          for (const match of writeMatches) {
+            const filePath = match[1].trim();
+            if (filePath && !filePath.includes("...")) {
+              modifiedFiles.add(filePath);
+            }
+          }
+
+          // Extract file paths from Edit tool calls
+          const editMatches = content.matchAll(
+            /(?:Edit|Editing)\s+(?:file\s+)?['":']?\s*([^\s'":\n]+\.[a-zA-Z]{1,10})/gi
+          );
+          for (const match of editMatches) {
+            const filePath = match[1].trim();
+            if (filePath && !filePath.includes("...")) {
+              modifiedFiles.add(filePath);
+            }
+          }
+
+          // Extract file_path parameters
+          const filePathMatches = content.matchAll(
+            /file_path['":\s]+([^\s'":\n]+\.[a-zA-Z]{1,10})/gi
+          );
+          for (const match of filePathMatches) {
+            const filePath = match[1].trim();
+            if (filePath && !filePath.includes("...")) {
+              modifiedFiles.add(filePath);
+            }
+          }
+        } catch {
+          // Skip files we can't read
+          continue;
+        }
+      }
+    } catch (error) {
+      console.error("Error parsing logs for modified files:", error);
+    }
+
+    return Array.from(modifiedFiles);
+  }
+
+  /**
    * Register a callback to be notified when workers complete or crash
    */
   onWorkerCompletion(callback: CompletionCallback): void {
@@ -1171,6 +1372,301 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
   }
 
   /**
+   * Create a snapshot branch before starting a worker.
+   * This allows rollback if the worker causes issues by preserving
+   * the state of HEAD before any worker modifications.
+   *
+   * Branch naming: swarm/{featureId}
+   *
+   * @param featureId - The feature ID to create a snapshot for
+   * @returns Object containing:
+   *   - success: Whether the branch was created
+   *   - branch: The branch name if successful
+   *   - error: Error message if failed
+   *
+   * @remarks
+   * If a snapshot branch already exists for this feature, it is deleted
+   * and recreated to ensure a fresh snapshot at current HEAD.
+   */
+  async createSnapshotBranch(featureId: string): Promise<{ success: boolean; branch?: string; error?: string }> {
+    const branchName = `swarm/${featureId}`;
+
+    try {
+      // Check if we're in a git repo
+      await execFileAsync("git", ["rev-parse", "--git-dir"], { cwd: this.projectDir });
+    } catch {
+      return { success: false, error: "Not a git repository" };
+    }
+
+    try {
+      // Delete existing branch if present (force fresh snapshot)
+      try {
+        await execFileAsync("git", ["branch", "-D", branchName], { cwd: this.projectDir });
+      } catch {
+        // Branch doesn't exist, that's fine
+      }
+
+      // Create new branch at current HEAD
+      await execFileAsync("git", ["branch", branchName], { cwd: this.projectDir });
+
+      return { success: true, branch: branchName };
+    } catch (error) {
+      return { success: false, error: `Failed to create snapshot branch: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * Rollback files changed by a feature to their state before the worker started.
+   * Uses the snapshot branch created by createSnapshotBranch() before the worker started.
+   *
+   * @param featureId - The feature ID to rollback
+   * @param files - Optional list of specific files to rollback. If not provided,
+   *                all files changed since the snapshot are rolled back.
+   * @returns Object containing:
+   *   - success: Whether the rollback succeeded
+   *   - restoredFiles: List of files that were restored (or removed if newly added)
+   *   - error: Error message if failed
+   *
+   * @remarks
+   * - Files that existed in the snapshot are restored to their snapshot state
+   * - Files that were added after the snapshot are removed
+   * - If specific files are provided, only those files are affected
+   *
+   * @warning Race condition: If other workers modified the same files, their changes
+   * will also be reverted. Use validate_workers to check for conflicts before rollback.
+   */
+  async rollbackFeature(featureId: string, files?: string[]): Promise<{ success: boolean; restoredFiles?: string[]; error?: string }> {
+    const branchName = `swarm/${featureId}`;
+
+    try {
+      // Check if branch exists
+      await execFileAsync("git", ["rev-parse", "--verify", branchName], { cwd: this.projectDir });
+    } catch {
+      return { success: false, error: `Snapshot branch ${branchName} not found. Was this feature started with rollback support?` };
+    }
+
+    try {
+      const restoredFiles: string[] = [];
+
+      if (files && files.length > 0) {
+        // Rollback specific files with path validation
+        const skippedFiles: string[] = [];
+
+        for (const file of files) {
+          // Security: Validate file path to prevent path traversal
+          if (!file || file.length === 0) {
+            continue; // Skip empty strings
+          }
+          if (file.includes('..')) {
+            skippedFiles.push(`${file} (path traversal rejected)`);
+            continue;
+          }
+          if (path.isAbsolute(file)) {
+            skippedFiles.push(`${file} (absolute path rejected)`);
+            continue;
+          }
+          // Normalize and ensure path stays within project
+          const normalizedPath = path.normalize(file);
+          if (normalizedPath.startsWith('..')) {
+            skippedFiles.push(`${file} (path escapes project)`);
+            continue;
+          }
+
+          try {
+            await execFileAsync("git", ["checkout", branchName, "--", normalizedPath], { cwd: this.projectDir });
+            restoredFiles.push(normalizedPath);
+          } catch (fileError) {
+            // File might not exist in snapshot - try to remove if it was added
+            try {
+              await execFileAsync("git", ["rm", "-f", normalizedPath], { cwd: this.projectDir });
+              restoredFiles.push(`${normalizedPath} (removed)`);
+            } catch {
+              // Ignore files that can't be restored
+            }
+          }
+        }
+
+        // Include skipped files in response for visibility
+        if (skippedFiles.length > 0) {
+          restoredFiles.push(...skippedFiles);
+        }
+      } else {
+        // Get list of files changed since snapshot
+        const { stdout: diffOutput } = await execFileAsync(
+          "git", ["diff", "--name-only", branchName, "HEAD"],
+          { cwd: this.projectDir }
+        );
+        const changedFiles = diffOutput.trim().split("\n").filter(f => f);
+
+        // Also check for new files not in snapshot
+        const { stdout: newFilesOutput } = await execFileAsync(
+          "git", ["diff", "--name-only", "--diff-filter=A", branchName, "HEAD"],
+          { cwd: this.projectDir }
+        );
+        const newFiles = newFilesOutput.trim().split("\n").filter(f => f);
+
+        // Remove new files
+        for (const file of newFiles) {
+          try {
+            await execFileAsync("git", ["rm", "-f", file], { cwd: this.projectDir });
+            restoredFiles.push(`${file} (removed)`);
+          } catch {
+            // Ignore
+          }
+        }
+
+        // Restore modified/deleted files
+        const modifiedFiles = changedFiles.filter(f => !newFiles.includes(f));
+        for (const file of modifiedFiles) {
+          try {
+            await execFileAsync("git", ["checkout", branchName, "--", file], { cwd: this.projectDir });
+            restoredFiles.push(file);
+          } catch {
+            // Ignore files that can't be restored
+          }
+        }
+      }
+
+      return { success: true, restoredFiles };
+    } catch (error) {
+      return { success: false, error: `Rollback failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * Delete a snapshot branch after successful feature completion.
+   * Called automatically by mark_complete when a feature succeeds.
+   *
+   * @param featureId - The feature ID whose snapshot branch to delete
+   *
+   * @remarks
+   * This method is idempotent - it silently succeeds if the branch doesn't exist.
+   */
+  async deleteSnapshotBranch(featureId: string): Promise<void> {
+    const branchName = `swarm/${featureId}`;
+    try {
+      await execFileAsync("git", ["branch", "-D", branchName], { cwd: this.projectDir });
+    } catch {
+      // Branch might not exist, that's fine
+    }
+  }
+
+  /**
+   * Clean up all swarm/* snapshot branches.
+   * Called during orchestrator_reset to remove accumulated branches.
+   *
+   * @returns The number of branches successfully deleted
+   *
+   * @remarks
+   * This method finds all branches matching the pattern `swarm/*` and
+   * deletes them. Individual branch deletion failures are silently ignored.
+   */
+  async cleanupAllSnapshotBranches(): Promise<number> {
+    try {
+      // List all swarm/* branches
+      const { stdout } = await execFileAsync(
+        "git", ["branch", "--list", "swarm/*"],
+        { cwd: this.projectDir }
+      );
+
+      const branches = stdout.split("\n")
+        .map(b => b.trim().replace(/^\*\s*/, ""))
+        .filter(b => b && b.length > 0 && b.startsWith("swarm/"));
+
+      let deleted = 0;
+      for (const branch of branches) {
+        try {
+          await execFileAsync("git", ["branch", "-D", branch], { cwd: this.projectDir });
+          deleted++;
+        } catch {
+          // Ignore individual branch deletion failures
+        }
+      }
+
+      return deleted;
+    } catch {
+      // Not a git repo or other error
+      return 0;
+    }
+  }
+
+  /**
+   * Check for potential conflicts before rolling back a feature.
+   * Compares files modified by the target feature against files modified
+   * by other features to detect overlapping changes.
+   *
+   * @param targetFeatureId - The feature ID to check rollback conflicts for
+   * @param allFeatures - Array of all features in the session
+   * @returns Object containing:
+   *   - hasConflicts: Whether any conflicts were detected
+   *   - conflicts: Array of conflicting features with shared files
+   *   - targetFiles: Files that would be rolled back
+   *
+   * @remarks
+   * Use this before calling rollbackFeature() in parallel worker environments
+   * to detect if rolling back would affect changes from other workers.
+   */
+  async checkRollbackConflicts(
+    targetFeatureId: string,
+    allFeatures: Array<{ id: string; status: string; modifiedFiles?: string[] }>
+  ): Promise<{
+    hasConflicts: boolean;
+    conflicts: Array<{
+      featureId: string;
+      status: string;
+      sharedFiles: string[];
+    }>;
+    targetFiles: string[];
+  }> {
+    // Get files modified by the target feature
+    const targetFiles = await this.getModifiedFilesForFeature(targetFeatureId);
+
+    if (targetFiles.length === 0) {
+      return { hasConflicts: false, conflicts: [], targetFiles: [] };
+    }
+
+    const targetFileSet = new Set(targetFiles);
+    const conflicts: Array<{
+      featureId: string;
+      status: string;
+      sharedFiles: string[];
+    }> = [];
+
+    // Check each other feature for file overlaps
+    for (const feature of allFeatures) {
+      if (feature.id === targetFeatureId) continue;
+      if (feature.status === "pending") continue; // Hasn't run yet
+
+      // Get modified files for this feature
+      let featureFiles: string[] = [];
+      if (feature.modifiedFiles && feature.modifiedFiles.length > 0) {
+        // Use cached data if available
+        featureFiles = feature.modifiedFiles;
+      } else if (feature.status === "in_progress" || feature.status === "completed" || feature.status === "failed") {
+        // Query git/logs for this feature's changes
+        featureFiles = await this.getModifiedFilesForFeature(feature.id);
+      }
+
+      // Find shared files
+      const sharedFiles = featureFiles.filter(f => targetFileSet.has(f));
+
+      if (sharedFiles.length > 0) {
+        conflicts.push({
+          featureId: feature.id,
+          status: feature.status,
+          sharedFiles,
+        });
+      }
+    }
+
+    return {
+      hasConflicts: conflicts.length > 0,
+      conflicts,
+      targetFiles,
+    };
+  }
+
+  /**
    * Start a review worker (code or architecture review)
    * Similar to planner workers: read-only tools + Write for findings file
    * Returns a unique session name for tracking
@@ -1292,6 +1788,9 @@ echo 'REVIEWER_EXITED' >> ${shellQuote(logFile)}
 
   /**
    * Check if a review worker session is still running
+   * Note: Review workers use different session naming (cc-reviewer-*) and completion
+   * detection (findings.json file instead of .done file), so we handle them separately
+   * from regular workers.
    */
   async checkReviewWorker(
     type: "code" | "architecture",
@@ -1304,18 +1803,78 @@ echo 'REVIEWER_EXITED' >> ${shellQuote(logFile)}
       return { status: "not_found" };
     }
 
+    let sessionName: string;
     try {
       const statusContent = JSON.parse(fs.readFileSync(statusFile, "utf-8"));
-      const sessionName = statusContent.sessionName;
+      sessionName = statusContent.sessionName;
 
       if (!sessionName || !validateSessionName(sessionName)) {
         return { status: "not_found" };
       }
-
-      return await this.checkWorker(sessionName, lines);
     } catch (error) {
       return { status: "not_found" };
     }
+
+    // Check if tmux session exists
+    let sessionExists = false;
+    try {
+      const result = await execFileAsync("tmux", [
+        "list-sessions",
+        "-F",
+        "#{session_name}",
+      ]);
+      sessionExists = result.stdout.includes(sessionName);
+    } catch {
+      // tmux might not be running, treat as no sessions
+      sessionExists = false;
+    }
+
+    if (sessionExists) {
+      // Session is running - capture output
+      try {
+        const { stdout: output } = await execFileAsync("tmux", [
+          "capture-pane",
+          "-t",
+          sessionName,
+          "-p",
+          "-S",
+          `-${Math.min(lines, 500)}`,
+        ]);
+        return {
+          status: "running",
+          output: this.truncateOutputLines(sanitizeOutput(output || "")),
+        };
+      } catch {
+        return { status: "running", output: "Unable to capture output" };
+      }
+    }
+
+    // Session has ended - check for findings file (indicates successful completion)
+    const findingsFile = path.join(this.workerDir, `${type}-review.findings.json`);
+    if (fs.existsSync(findingsFile)) {
+      // Read log file for context
+      const logFile = path.join(this.workerDir, `${type}-review.log`);
+      let output = "Review completed successfully.";
+      if (fs.existsSync(logFile)) {
+        const log = fs.readFileSync(logFile, "utf-8");
+        const lastLines = log.split("\n").slice(-lines).join("\n");
+        output = `Review completed.\n\nLast output:\n${this.truncateOutputLines(sanitizeOutput(lastLines))}`;
+      }
+      return { status: "completed", output };
+    }
+
+    // No findings file - check log for crash/exit info
+    const logFile = path.join(this.workerDir, `${type}-review.log`);
+    if (fs.existsSync(logFile)) {
+      const log = fs.readFileSync(logFile, "utf-8");
+      const lastLines = log.split("\n").slice(-lines).join("\n");
+      return {
+        status: "crashed",
+        output: `Review worker exited without producing findings.\n\nLast output:\n${this.truncateOutputLines(sanitizeOutput(lastLines))}`,
+      };
+    }
+
+    return { status: "not_found", output: "Review worker session not found and no logs available." };
   }
 
   /**

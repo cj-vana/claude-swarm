@@ -710,7 +710,7 @@
                 <div class="flex gap-2 text-xs py-1.5 border-b border-gray-200 dark:border-gray-800 last:border-0">
                     <span class="text-gray-500 font-mono flex-shrink-0">${formatTimestamp(entry.timestamp)}</span>
                     <span class="${colorClass} flex-shrink-0">[${entry.type}]</span>
-                    <span class="text-gray-700 dark:text-gray-300 truncate">${entry.message}</span>
+                    <span class="text-gray-700 dark:text-gray-300 break-words whitespace-normal">${entry.message}</span>
                 </div>
             `;
         }

@@ -3,7 +3,7 @@
  *
  * Key responsibilities:
  * - Build review prompts with appropriate context
- * - Gather modified files from worker logs
+ * - Delegate file tracking to WorkerManager (git-based with log parsing fallback)
  * - Start and monitor review workers
  * - Aggregate review findings into the progress log
  *
@@ -12,8 +12,6 @@
  * - Prompts are passed via files, not shell strings
  */
 
-import * as fs from "fs";
-import * as path from "path";
 import {
   Feature,
   OrchestratorState,
@@ -44,6 +42,7 @@ export const DEFAULT_REVIEW_CONFIG: ReviewConfig = {
   skipOnFailure: false,
   codeReviewEnabled: true,
   architectureReviewEnabled: true,
+  autoTrigger: true, // Automatically start reviews when all features complete
 };
 
 /**
@@ -61,82 +60,9 @@ export type ReviewSeverity = (typeof REVIEW_SEVERITY_ORDER)[number];
 
 export class ReviewManager {
   private projectDir: string;
-  private workerDir: string;
 
   constructor(projectDir: string) {
     this.projectDir = projectDir;
-    this.workerDir = path.join(
-      projectDir,
-      ".claude",
-      "orchestrator",
-      "workers"
-    );
-  }
-
-  /**
-   * Get list of files modified during this session
-   * Parses worker logs to extract Write/Edit tool calls
-   */
-  async getModifiedFiles(): Promise<string[]> {
-    const modifiedFiles = new Set<string>();
-
-    try {
-      if (!fs.existsSync(this.workerDir)) {
-        return [];
-      }
-
-      const files = fs.readdirSync(this.workerDir);
-      const logFiles = files.filter((f) => f.endsWith(".log"));
-
-      for (const logFile of logFiles) {
-        try {
-          const content = fs.readFileSync(
-            path.join(this.workerDir, logFile),
-            "utf-8"
-          );
-
-          // Extract file paths from Write tool calls
-          const writeMatches = content.matchAll(
-            /(?:Write|Writing)\s+(?:to\s+)?(?:file\s+)?['":]?\s*([^\s'":\n]+\.[a-zA-Z]{1,10})/gi
-          );
-          for (const match of writeMatches) {
-            const filePath = match[1].trim();
-            if (filePath && !filePath.includes("...")) {
-              modifiedFiles.add(filePath);
-            }
-          }
-
-          // Extract file paths from Edit tool calls
-          const editMatches = content.matchAll(
-            /(?:Edit|Editing)\s+(?:file\s+)?['":]?\s*([^\s'":\n]+\.[a-zA-Z]{1,10})/gi
-          );
-          for (const match of editMatches) {
-            const filePath = match[1].trim();
-            if (filePath && !filePath.includes("...")) {
-              modifiedFiles.add(filePath);
-            }
-          }
-
-          // Extract file_path parameters
-          const filePathMatches = content.matchAll(
-            /file_path['":\s]+([^\s'":\n]+\.[a-zA-Z]{1,10})/gi
-          );
-          for (const match of filePathMatches) {
-            const filePath = match[1].trim();
-            if (filePath && !filePath.includes("...")) {
-              modifiedFiles.add(filePath);
-            }
-          }
-        } catch (error) {
-          // Skip files we can't read
-          continue;
-        }
-      }
-    } catch (error) {
-      console.error("Error getting modified files:", error);
-    }
-
-    return Array.from(modifiedFiles);
   }
 
   /**
@@ -263,15 +189,22 @@ Begin your architectural review now. Write the findings JSON file when complete.
   }
 
   /**
-   * Start review workers based on configuration
+   * Start review workers based on configuration.
+   * Delegates file tracking to WorkerManager for unified git-based tracking.
+   *
+   * @param state - Current orchestrator state
+   * @param workers - Worker manager for starting review workers and getting modified files
+   * @param config - Review configuration
+   * @returns Array of started review workers
    */
   async startReviews(
     state: OrchestratorState,
     workers: WorkerManager,
     config: ReviewConfig = DEFAULT_REVIEW_CONFIG
   ): Promise<ReviewWorker[]> {
+    // Delegate file tracking to WorkerManager for unified git-based tracking
     const context: ReviewContext = {
-      modifiedFiles: await this.getModifiedFiles(),
+      modifiedFiles: await workers.getAllModifiedFiles(),
       allFeatures: state.features,
       taskDescription: state.taskDescription,
       sessionStartTime: state.startTime,

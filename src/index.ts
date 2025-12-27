@@ -246,6 +246,26 @@ server.tool(
       }
     }
 
+    // Also check for review findings if session is completed but aggregatedReview is missing
+    // This handles the case where reviews finished but findings weren't loaded
+    if ((current.status === "completed" || current.status === "completed_with_failures") &&
+        !current.aggregatedReview && current.reviewWorkers && current.reviewWorkers.length > 0) {
+      const reviewManager = new ReviewManager(projectDir);
+
+      // Update review worker statuses by checking findings files
+      const { allDone, reviewWorkers } = await reviewManager.checkReviewStatus(
+        current.reviewWorkers,
+        workers
+      );
+      current.reviewWorkers = reviewWorkers;
+
+      if (allDone) {
+        current.aggregatedReview = reviewManager.aggregateReviews(reviewWorkers);
+        reviewStatusUpdated = true;
+        state.save(current);
+      }
+    }
+
     // Update worker statuses from tmux
     const workerStatuses = await workers.checkAllWorkers();
 
@@ -304,6 +324,15 @@ server.tool(
         statusText += `\n  🏁 Reviews completed! Use get_review_results for detailed findings.\n`;
       }
       statusText += `\n`;
+    }
+
+    // Show verification config if set
+    if (current.verificationConfig?.commands?.length) {
+      statusText += `🔧 Verification Commands:\n`;
+      for (const cmd of current.verificationConfig.commands) {
+        statusText += `  - \`${cmd}\`\n`;
+      }
+      statusText += `  Mode: ${current.verificationConfig.failOnError ? "Must pass" : "Warnings only"}\n\n`;
     }
 
     if (inProgress.length > 0) {
@@ -713,7 +742,25 @@ server.tool(
       for (const w of warnings) {
         responseText += `  - ${w.feature1} ↔ ${w.feature2}: ${w.reason}\n`;
       }
-      responseText += `\n  Consider running these features sequentially to avoid conflicts.\n\n`;
+      responseText += `\n`;
+
+      // Find features involved in conflicts
+      const conflictingFeatures = new Set<string>();
+      for (const w of warnings) {
+        conflictingFeatures.add(w.feature1);
+        conflictingFeatures.add(w.feature2);
+      }
+
+      // Find features that can run safely in parallel
+      const safeFeatures = ready.filter(r => !conflictingFeatures.has(r.id));
+      if (safeFeatures.length > 0) {
+        responseText += `  ✅ Safe to run in parallel: ${safeFeatures.map(f => f.id).join(", ")}\n`;
+      }
+
+      responseText += `\n  💡 Mitigation options:\n`;
+      responseText += `     1. Run conflicting features sequentially (safest)\n`;
+      responseText += `     2. Use set_dependencies to order features explicitly\n`;
+      responseText += `     3. If workers modify different parts of the same file, parallel may still work\n\n`;
     }
 
     if (issues.length > 0) {
@@ -1108,6 +1155,12 @@ server.tool(
       await workers.killWorker(feature.workerId);
     }
 
+    // Extract modified files from the worker log
+    const modifiedFiles = await workers.getModifiedFilesForFeature(featureId);
+    if (modifiedFiles.length > 0) {
+      feature.modifiedFiles = modifiedFiles;
+    }
+
     let resultStatus: string;
     let willRetry = false;
 
@@ -1116,6 +1169,9 @@ server.tool(
       feature.status = "completed";
       feature.completedAt = new Date().toISOString();
       resultStatus = "completed";
+
+      // Clean up snapshot branch on successful completion
+      await workers.deleteSnapshotBranch(featureId);
     } else {
       // Check if we should auto-retry
       if (maxRetries > 0 && feature.attempts < maxRetries) {
@@ -1159,6 +1215,7 @@ server.tool(
       // Check if reviews should be triggered
       const reviewConfig = current.reviewConfig || DEFAULT_REVIEW_CONFIG;
       const shouldReview = reviewConfig.enabled &&
+        reviewConfig.autoTrigger &&
         (allSucceeded || !reviewConfig.skipOnFailure) &&
         (reviewConfig.codeReviewEnabled || reviewConfig.architectureReviewEnabled);
 
@@ -1182,6 +1239,12 @@ server.tool(
         current.status = allSucceeded ? "completed" : "completed_with_failures";
         current.completedAt = new Date().toISOString();
         current.progressLog.push(`[${new Date().toISOString()}] 🏁 Orchestration ${allSucceeded ? "completed successfully" : "completed with failures"}`);
+
+        // Clean up all remaining snapshot branches (session is done, rollback no longer possible)
+        const cleanedBranches = await workers.cleanupAllSnapshotBranches();
+        if (cleanedBranches > 0) {
+          current.progressLog.push(`[${new Date().toISOString()}] 🧹 Cleaned up ${cleanedBranches} snapshot branch(es)`);
+        }
       }
     }
 
@@ -1323,6 +1386,148 @@ server.tool(
           text: responseText,
         },
       ],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: rollback_feature
+// ============================================================================
+server.tool(
+  "rollback_feature",
+  "Roll back files changed by a feature worker to their pre-worker state using git. Each worker creates a snapshot branch before starting that can be used for rollback.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    featureId: z.string().describe("ID of the feature to rollback"),
+    files: z.array(z.string()).optional().describe("Specific files to rollback. If not provided, all files changed by the worker will be rolled back."),
+  },
+  async ({ projectDir, featureId, files }) => {
+    const { workers } = await ensureInitialized(projectDir);
+
+    // Validate feature ID format
+    try {
+      validateFeatureId(featureId);
+    } catch (error: any) {
+      return {
+        content: [{ type: "text", text: `Invalid feature ID: ${error.message}` }],
+      };
+    }
+
+    const result = await workers.rollbackFeature(featureId, files);
+
+    if (!result.success) {
+      return {
+        content: [{ type: "text", text: `❌ Rollback failed: ${result.error}` }],
+      };
+    }
+
+    let responseText = `🔙 Rollback successful for feature ${featureId}\n\n`;
+    if (result.restoredFiles && result.restoredFiles.length > 0) {
+      responseText += `Restored files (${result.restoredFiles.length}):\n`;
+      for (const file of result.restoredFiles) {
+        responseText += `  - ${file}\n`;
+      }
+    } else {
+      responseText += `No files were changed since the snapshot.\n`;
+    }
+    responseText += `\n💡 The working directory now matches the state before the worker started.\n`;
+    responseText += `Use retry_feature to try implementing again.\n\n`;
+    responseText += `⚠️  Race condition warning: If other workers modified the same files, their changes were also reverted.\n`;
+    responseText += `Run check_rollback_conflicts before rollback in parallel worker environments to detect file conflicts.`;
+
+    return {
+      content: [{ type: "text", text: responseText }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: check_rollback_conflicts
+// ============================================================================
+server.tool(
+  "check_rollback_conflicts",
+  "Check for potential conflicts before rolling back a feature. Compares files modified by the target feature against files modified by other features to detect overlapping changes that would be affected by rollback.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    featureId: z.string().describe("ID of the feature to check rollback conflicts for"),
+  },
+  async ({ projectDir, featureId }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
+
+    // Validate feature ID format
+    try {
+      validateFeatureId(featureId);
+    } catch (error: any) {
+      return {
+        content: [{ type: "text", text: `Invalid feature ID: ${error.message}` }],
+      };
+    }
+
+    // Load current state
+    const current = state.load();
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active orchestration session. Use orchestrator_init first." }],
+      };
+    }
+
+    // Check if feature exists
+    const feature = current.features.find((f: { id: string }) => f.id === featureId);
+    if (!feature) {
+      return {
+        content: [{ type: "text", text: `Feature ${featureId} not found` }],
+      };
+    }
+
+    const result = await workers.checkRollbackConflicts(featureId, current.features);
+
+    let responseText = `🔍 Rollback Conflict Check for ${featureId}\n\n`;
+
+    if (result.targetFiles.length === 0) {
+      responseText += `No modified files detected for this feature.\n`;
+      responseText += `Either the worker hasn't made changes yet, or the snapshot branch is missing.`;
+      return {
+        content: [{ type: "text", text: responseText }],
+      };
+    }
+
+    responseText += `Files that would be rolled back (${result.targetFiles.length}):\n`;
+    for (const file of result.targetFiles.slice(0, 20)) {
+      responseText += `  - ${file}\n`;
+    }
+    if (result.targetFiles.length > 20) {
+      responseText += `  ... and ${result.targetFiles.length - 20} more\n`;
+    }
+
+    responseText += `\n`;
+
+    if (!result.hasConflicts) {
+      responseText += `✅ No conflicts detected!\n`;
+      responseText += `Safe to proceed with rollback_feature.`;
+    } else {
+      responseText += `⚠️  CONFLICTS DETECTED!\n\n`;
+      responseText += `The following features have modified the same files:\n\n`;
+
+      for (const conflict of result.conflicts) {
+        responseText += `• ${conflict.featureId} (${conflict.status}):\n`;
+        for (const file of conflict.sharedFiles.slice(0, 5)) {
+          responseText += `    - ${file}\n`;
+        }
+        if (conflict.sharedFiles.length > 5) {
+          responseText += `    ... and ${conflict.sharedFiles.length - 5} more shared files\n`;
+        }
+        responseText += `\n`;
+      }
+
+      responseText += `⛔ Rolling back ${featureId} will revert changes from these features too!\n\n`;
+      responseText += `Options:\n`;
+      responseText += `1. Roll back specific non-conflicting files only\n`;
+      responseText += `2. Wait for conflicting features to complete and re-evaluate\n`;
+      responseText += `3. Proceed with caution if you understand the implications`;
+    }
+
+    return {
+      content: [{ type: "text", text: responseText }],
     };
   }
 );
@@ -1573,16 +1778,20 @@ server.tool(
     // Kill all workers
     await workers.killAllWorkers();
 
+    // Clean up all swarm/* snapshot branches
+    const branchesDeleted = await workers.cleanupAllSnapshotBranches();
+
     // Clear state
     state.clear();
 
+    let response = "🔄 Orchestration reset. All workers killed and state cleared.";
+    if (branchesDeleted > 0) {
+      response += `\n🗑️ Cleaned up ${branchesDeleted} snapshot branch(es).`;
+    }
+    response += "\n\nUse orchestrator_init to start a new session.";
+
     return {
-      content: [
-        {
-          type: "text",
-          text: "🔄 Orchestration reset. All workers killed and state cleared.\n\nUse orchestrator_init to start a new session.",
-        },
-      ],
+      content: [{ type: "text", text: response }],
     };
   }
 );
@@ -4964,6 +5173,7 @@ server.tool(
       skipOnFailure: false,
       codeReviewEnabled: reviewTypes.includes("code"),
       architectureReviewEnabled: reviewTypes.includes("architecture"),
+      autoTrigger: true,
     };
 
     // Start reviews
@@ -5044,6 +5254,12 @@ server.tool(
       const reviewLogs = reviewManager.formatReviewsForLog(current.aggregatedReview);
       current.progressLog.push(...reviewLogs);
       current.progressLog.push(`[${new Date().toISOString()}] 🏁 Orchestration completed with reviews.`);
+
+      // Clean up all remaining snapshot branches (session is done, rollback no longer possible)
+      const cleanedBranches = await workers.cleanupAllSnapshotBranches();
+      if (cleanedBranches > 0) {
+        current.progressLog.push(`[${new Date().toISOString()}] 🧹 Cleaned up ${cleanedBranches} snapshot branch(es)`);
+      }
     }
 
     state.save(current);
@@ -5216,8 +5432,9 @@ server.tool(
     skipOnFailure: z.boolean().optional().describe("Skip reviews if any features failed"),
     codeReviewEnabled: z.boolean().optional().describe("Enable code quality reviews"),
     architectureReviewEnabled: z.boolean().optional().describe("Enable architecture reviews"),
+    autoTrigger: z.boolean().optional().describe("Automatically start reviews when all features complete (default: true). Set to false to trigger manually via run_review."),
   },
-  async ({ projectDir, enabled, skipOnFailure, codeReviewEnabled, architectureReviewEnabled }) => {
+  async ({ projectDir, enabled, skipOnFailure, codeReviewEnabled, architectureReviewEnabled, autoTrigger }) => {
     const { state } = await ensureInitialized(projectDir);
     const current = state.load();
 
@@ -5236,6 +5453,7 @@ server.tool(
       skipOnFailure: skipOnFailure ?? currentConfig.skipOnFailure,
       codeReviewEnabled: codeReviewEnabled ?? currentConfig.codeReviewEnabled,
       architectureReviewEnabled: architectureReviewEnabled ?? currentConfig.architectureReviewEnabled,
+      autoTrigger: autoTrigger ?? currentConfig.autoTrigger,
     };
 
     current.reviewConfig = newConfig;
@@ -5245,9 +5463,97 @@ server.tool(
 
     let response = `## Review Configuration Updated\n\n`;
     response += `- **Auto-review enabled**: ${newConfig.enabled ? "Yes" : "No"}\n`;
+    response += `- **Auto-trigger on completion**: ${newConfig.autoTrigger ? "Yes" : "No (use run_review manually)"}\n`;
     response += `- **Skip on feature failure**: ${newConfig.skipOnFailure ? "Yes" : "No"}\n`;
     response += `- **Code review**: ${newConfig.codeReviewEnabled ? "Enabled" : "Disabled"}\n`;
     response += `- **Architecture review**: ${newConfig.architectureReviewEnabled ? "Enabled" : "Disabled"}\n`;
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: configure_verification
+// ============================================================================
+server.tool(
+  "configure_verification",
+  "Configure pre-completion verification commands that workers must run before marking a feature as complete. Use this to enforce type checking, linting, or tests.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    commands: z.array(z.string()).optional()
+      .describe("Commands workers must run before completion (e.g., ['npm run build', 'npx tsc --noEmit'])"),
+    failOnError: z.boolean().optional()
+      .describe("Whether workers should fix errors before proceeding (default: true)"),
+    clear: z.boolean().optional()
+      .describe("Clear all verification commands (default: false)"),
+  },
+  async ({ projectDir, commands, failOnError, clear }) => {
+    const { state } = await ensureInitialized(projectDir);
+    const current = state.load();
+
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "❌ No active orchestration session. Use orchestrator_init first." }],
+      };
+    }
+
+    if (clear) {
+      current.verificationConfig = undefined;
+      current.progressLog.push(`[${new Date().toISOString()}] ⚙️ Verification configuration cleared`);
+      state.save(current);
+      state.writeProgressFile();
+      return {
+        content: [{ type: "text", text: "## Verification Configuration Cleared\n\nWorkers will no longer run verification commands before completion." }],
+      };
+    }
+
+    // Validate commands against allowlist if provided
+    if (commands && commands.length > 0) {
+      const invalidCommands: string[] = [];
+      for (const cmd of commands) {
+        try {
+          validateCommand(cmd);
+        } catch (error: any) {
+          invalidCommands.push(`${cmd}: ${error.message}`);
+        }
+      }
+      if (invalidCommands.length > 0) {
+        return {
+          content: [{
+            type: "text",
+            text: `❌ Invalid verification commands:\n${invalidCommands.map(c => `  - ${c}`).join("\n")}\n\nOnly safe commands (npm test, npx tsc, etc.) are allowed.`,
+          }],
+        };
+      }
+    }
+
+    // Get current config or defaults
+    const currentConfig = current.verificationConfig || { commands: [], failOnError: true };
+
+    // Update with provided values
+    const newConfig = {
+      commands: commands ?? currentConfig.commands,
+      failOnError: failOnError ?? currentConfig.failOnError,
+    };
+
+    current.verificationConfig = newConfig;
+    current.progressLog.push(`[${new Date().toISOString()}] ⚙️ Verification configuration updated: ${newConfig.commands.length} command(s)`);
+    state.save(current);
+    state.writeProgressFile();
+
+    let response = `## Verification Configuration Updated\n\n`;
+    response += `- **Fail on error**: ${newConfig.failOnError ? "Yes (workers must fix issues)" : "No (warnings only)"}\n`;
+    response += `- **Commands** (${newConfig.commands.length}):\n`;
+    if (newConfig.commands.length > 0) {
+      for (const cmd of newConfig.commands) {
+        response += `  - \`${cmd}\`\n`;
+      }
+    } else {
+      response += `  _(none configured)_\n`;
+    }
+    response += `\nWorkers will run these commands before creating their .done file.`;
 
     return {
       content: [{ type: "text", text: response }],
