@@ -43,7 +43,7 @@ export function calculateGitVerification(
 
     // Get diff statistics
     const diffStat = execSync(
-      `git diff ${beforeHash}${afterHash ? `.${afterHash}` : ""} --numstat`,
+      `git diff ${beforeHash}..${compareTarget} --numstat`,
       {
         cwd: projectDir,
         encoding: "utf-8",
@@ -52,7 +52,7 @@ export function calculateGitVerification(
 
     // Get list of changed files
     const filesChanged = execSync(
-      `git diff ${beforeHash}${afterHash ? `.${afterHash}` : ""} --name-only`,
+      `git diff ${beforeHash}..${compareTarget} --name-only`,
       {
         cwd: projectDir,
         encoding: "utf-8",
@@ -81,7 +81,7 @@ export function calculateGitVerification(
 
     // Get full diff for checksum
     const fullDiff = execSync(
-      `git diff ${beforeHash}${afterHash ? `.${afterHash}` : ""}`,
+      `git diff ${beforeHash}..${compareTarget}`,
       {
         cwd: projectDir,
         encoding: "utf-8",
