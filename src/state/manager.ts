@@ -88,11 +88,7 @@ export interface Feature {
     selectionReason?: string;
   };
 
-  // Multi-agent voting fields
-  votingGroup?: string; // e.g., "feature-5-voting" - identifies voting group
-  votingRole?: "voter-1" | "voter-2" | "voter-3"; // Which voter in the group
-  votingScore?: number; // Score after evaluation (0-100)
-  votingWinner?: boolean; // True if this solution won the vote
+  votingRole?: `voter-${number}`; // Which voter in the group
 }
 
 export interface WorkerStatus {
