@@ -133,7 +133,9 @@ export function verifyExpectedPackages(
 
   // Check if any changed file is in expected packages
   const matchedFiles = verification.filesChanged.filter((file) =>
-    expectedPackages.some((pkg) => file.startsWith(pkg))
+    expectedPackages.some((pkg) =>
+      file === pkg || file.startsWith(pkg + "/")
+    )
   );
 
   const matched = matchedFiles.length > 0;

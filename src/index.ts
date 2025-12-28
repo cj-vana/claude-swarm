@@ -2398,11 +2398,7 @@ server.tool(
         }
       }
 
-      // +30 points: Minimal diff (check git diff size)
-      try {
-        const { stdout: gitDiff } = await execAsync(`git diff HEAD -- ':(exclude).claude/'`, { cwd: projectDir });
-        const lineCount = gitDiff.split("\n").length;
-        if (lineCount < 50) score += 30;
+        const { stdout: gitDiff } = await execAsync(`git diff HEAD -- . ':(exclude).claude/'`, { cwd: projectDir });
         else if (lineCount < 100) score += 20;
         else if (lineCount < 200) score += 10;
       } catch {
