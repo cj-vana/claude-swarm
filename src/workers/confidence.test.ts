@@ -253,11 +253,7 @@ describe('workers/confidence module', () => {
       });
 
       const result = calculateAggregatedConfidence(signals);
-
-      // 80 * 0.35 + 70 * 0.35 + 60 * 0.3 = 28 + 24.5 + 18 = 70.5 → 71
-      expect(result.score).toBeCloseTo(71, 0);
-    });
-
+      expect(result.score).toBe(71);
     it('should redistribute weights when self-reported is null', () => {
       const signals = createSignals({
         toolActivity: { ...createSignals().toolActivity, score: 80 },
