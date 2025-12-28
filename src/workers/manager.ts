@@ -311,8 +311,13 @@ Begin exploring and planning now.`;
 set -e
 cd ${shellQuote(this.projectDir)}
 PROMPT=$(cat ${shellQuote(promptFile)})
-# Planning mode: only read-only tools plus Write for the plan file
-claude -p "$PROMPT" --allowedTools Read,Glob,Grep,Write 2>&1 | tee ${shellQuote(logFile)}
+# Prefer claude-code for Max plan compatibility (uses session auth, not API credits)
+# Falls back to claude (API mode) if claude-code is unavailable
+if command -v claude-code &> /dev/null; then
+  claude-code -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
+else
+  claude -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
+fi
 echo 'PLANNER_EXITED' >> ${shellQuote(logFile)}
 `;
       fs.writeFileSync(wrapperScript, scriptContent, { mode: 0o700 });
@@ -432,7 +437,13 @@ echo 'PLANNER_EXITED' >> ${shellQuote(logFile)}
 set -e
 cd ${shellQuote(this.projectDir)}
 PROMPT=$(cat ${shellQuote(promptFile)})
-claude -p "$PROMPT" --allowedTools Bash,Read,Write,Edit,Glob,Grep 2>&1 | tee ${shellQuote(logFile)}
+# Prefer claude-code for Max plan compatibility (uses session auth, not API credits)
+# Falls back to claude (API mode) if claude-code is unavailable
+if command -v claude-code &> /dev/null; then
+  claude-code -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
+else
+  claude -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
+fi
 echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
 `;
       fs.writeFileSync(wrapperScript, scriptContent, { mode: 0o700 });
