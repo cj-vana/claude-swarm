@@ -27,17 +27,56 @@ import { ComplexityResult } from "../utils/complexity-detector.js";
 import { PlanSubmission } from "../utils/plan-evaluator.js";
 import { ConfidenceAlert } from "../workers/confidence.js";
 
+export interface ValidationConfig {
+  enabled: boolean;
+  coverageTarget?: number; // e.g., 50.0 for 50%
+  testPassRequired?: boolean;
+  enforceBlocking: boolean; // If true, validation failures block completion
+  verifyCommand?: string; // e.g., "go test -cover ./internal/..."
+  expectedPackages?: string[]; // e.g., ["internal/tui/components/chat"]
+}
+
+export interface ValidationCheck {
+  name: string;
+  passed: boolean;
+  expected?: number;
+  actual?: number;
+  details?: string;
+}
+
+export interface ValidationResult {
+  passed: boolean;
+  checks: ValidationCheck[];
+  error?: string;
+  timestamp: string;
+}
+
+export interface GitVerification {
+  beforeHash: string;
+  afterHash: string;
+  filesChanged: string[];
+  linesAdded: number;
+  linesDeleted: number;
+  diffChecksum: string;
+}
+
 export interface Feature {
   id: string;
   description: string;
   status: "pending" | "in_progress" | "completed" | "failed";
   attempts: number;
+  maxRetries?: number; // Default 3
   workerId?: string;
   startedAt?: string;
   completedAt?: string;
   lastError?: string;
   notes?: string;
   dependsOn?: string[]; // Array of feature IDs this feature depends on
+
+  // Validation fields (NEW)
+  validation?: ValidationConfig;
+  validationResult?: ValidationResult;
+  gitVerification?: GitVerification;
 
   // Competitive planning fields
   complexity?: ComplexityResult;
@@ -48,6 +87,12 @@ export interface Feature {
     selectedPlan?: "A" | "B";
     selectionReason?: string;
   };
+
+  // Multi-agent voting fields
+  votingGroup?: string; // e.g., "feature-5-voting" - identifies voting group
+  votingRole?: "voter-1" | "voter-2" | "voter-3"; // Which voter in the group
+  votingScore?: number; // Score after evaluation (0-100)
+  votingWinner?: boolean; // True if this solution won the vote
 }
 
 export interface WorkerStatus {

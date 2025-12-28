@@ -28,9 +28,53 @@ import {
   getWorkerConfidence,
   AggregatedConfidence,
 } from "./confidence.js";
+import { buildStructuredPrompt } from "../utils/prompt-templates.js";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
+
+/**
+ * Default tools available to workers
+ * Override via CLAUDE_SWARM_ALLOWED_TOOLS env var (comma-separated)
+ */
+const DEFAULT_WORKER_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,Task,TodoWrite";
+
+/**
+ * Build worker CLI flags for tool access and MCP configuration
+ * All config is via env vars - no restart needed after changing them
+ *
+ * Environment variables:
+ * - CLAUDE_SWARM_ALLOWED_TOOLS: Tools to allow (default: Bash,Read,Write,Edit,Glob,Grep,Task,TodoWrite)
+ * - CLAUDE_SWARM_MCP_SERVERS: JSON object of MCP servers to include (default: {})
+ * - CLAUDE_SWARM_PERMISSION_MODE: Permission mode (default: bypassPermissions)
+ */
+function getWorkerFlags(): string {
+  const allowedTools = process.env.CLAUDE_SWARM_ALLOWED_TOOLS || DEFAULT_WORKER_TOOLS;
+  const permissionMode = process.env.CLAUDE_SWARM_PERMISSION_MODE || "bypassPermissions";
+  const mcpServersJson = process.env.CLAUDE_SWARM_MCP_SERVERS || "{}";
+
+  // Parse MCP servers (validate JSON)
+  let mcpServers = {};
+  try {
+    mcpServers = JSON.parse(mcpServersJson);
+  } catch {
+    // Invalid JSON, use empty
+  }
+
+  const flags: string[] = [];
+
+  // Explicitly allow specific tools (bypasses permission prompts for these)
+  flags.push(`--allowedTools "${allowedTools}"`);
+
+  // Set permission mode (bypassPermissions for headless workers)
+  flags.push(`--permission-mode ${permissionMode}`);
+
+  // Use inline MCP config with specified servers (empty by default)
+  const mcpConfig = JSON.stringify({ mcpServers });
+  flags.push(`--mcp-config '${mcpConfig}'`);
+
+  return flags.join(" ");
+}
 
 interface StartWorkerResult {
   success: boolean;
@@ -146,8 +190,74 @@ export class WorkerManager {
     const taskContext = state?.taskDescription || "";
     const projectContext = this.readProjectContext();
 
-    // Build a focused prompt for the worker
-    let prompt = `You are a worker agent focused on implementing a single feature.
+    // Build structured prompt with validation criteria if enabled
+    let prompt = "";
+
+    if (feature.validation?.enabled) {
+      // Use structured prompt template with success criteria
+      const structuredPrompt = buildStructuredPrompt(feature, customPrompt);
+      prompt = `You are a worker agent focused on implementing a single feature with validation criteria.
+
+${structuredPrompt}
+
+## Orchestration Context
+${taskContext}
+${projectContext}
+
+## Implementation Steps (REQUIRED)
+
+### Phase 1: Get Your Bearings (ALWAYS START HERE)
+1. Run 'pwd' to see your working directory
+2. Read git logs: 'git log --oneline -20' to see recent work
+3. Read claude-progress.txt (if it exists) to understand what was recently done
+4. Read the feature list to understand overall progress
+5. If init.sh exists, read it to understand how to run/test the project
+
+### Phase 2: Verify Environment Health
+1. Run basic tests or start development server (if applicable)
+2. Verify the codebase is in a working state
+3. If broken, fix critical bugs BEFORE implementing your feature
+4. Document any fixes in your .done file
+
+### Phase 3: Implement Your Feature
+1. Read the relevant source files to understand current implementation
+2. Make the necessary code changes using Edit or Write tools
+3. Test your changes thoroughly:
+   - Run automated tests (unit, integration)
+   - For web features: Use Chrome DevTools MCP to test in browser as a user would
+   - Verify syntax, check behavior end-to-end
+   - Take screenshots of working features if applicable
+4. ONLY AFTER code changes are complete AND tested: Create .claude/orchestrator/workers/${feature.id}.done
+
+   The .done file MUST contain:
+   - List of files you modified (with line numbers if applicable)
+   - Summary of changes made to each file
+   - Any tests you ran and their results
+   - If BLOCKED: explain what blocked you and what you tried
+
+### Phase 4: Leave Environment Clean
+1. Do NOT commit - the orchestrator handles commits
+2. Ensure all tests pass
+3. Ensure code is in a working state for the next worker
+
+## Critical Requirements
+- You MUST make actual code changes - reading files is not enough
+- You MUST use Edit/Write tools to modify source code
+- Do NOT create the .done file until you have modified code
+- If you encounter a blocker, document it in .done and explain what prevented completion
+- Keep changes minimal and focused on this single feature
+- NEVER commit, stage, or git add ANY of these files:
+  - .claude/ (entire directory - orchestrator state, logs, prompts, worker files)
+  - claude-progress.txt
+  - init.sh
+  - *.prompt, *.log, *.done, *.status files in .claude/
+
+${customPrompt && !feature.validation?.enabled ? `\n## Additional Context\n${customPrompt}` : ""}
+
+Begin implementing the feature now.`;
+    } else {
+      // Legacy prompt without validation
+      prompt = `You are a worker agent focused on implementing a single feature.
 
 ## Your Task
 ${feature.description}
@@ -156,18 +266,48 @@ ${feature.description}
 ${taskContext}
 ${projectContext}
 
-## Instructions
-1. Focus ONLY on implementing this specific feature
-2. Make small, incremental changes
-3. Test your changes as you go
-4. When you are DONE, create a file at: .claude/orchestrator/workers/${feature.id}.done
-   with a brief summary of what you implemented
-5. Do NOT commit your changes - the orchestrator will handle commits
+## Implementation Steps (REQUIRED)
 
-## Important
-- Do not work on other features
-- If you encounter a blocker, document it in the .done file and stop
-- Keep changes minimal and focused
+### Phase 1: Get Your Bearings (ALWAYS START HERE)
+1. Run 'pwd' to see your working directory
+2. Read git logs: 'git log --oneline -20' to see recent work
+3. Read claude-progress.txt (if it exists) to understand what was recently done
+4. Read the feature list to understand overall progress
+5. If init.sh exists, read it to understand how to run/test the project
+
+### Phase 2: Verify Environment Health
+1. Run basic tests or start development server (if applicable)
+2. Verify the codebase is in a working state
+3. If broken, fix critical bugs BEFORE implementing your feature
+4. Document any fixes in your .done file
+
+### Phase 3: Implement Your Feature
+1. Read the relevant source files to understand current implementation
+2. Make the necessary code changes using Edit or Write tools
+3. Test your changes thoroughly:
+   - Run automated tests (unit, integration)
+   - For web features: Use Chrome DevTools MCP to test in browser as a user would
+   - Verify syntax, check behavior end-to-end
+   - Take screenshots of working features if applicable
+4. ONLY AFTER code changes are complete AND tested: Create .claude/orchestrator/workers/${feature.id}.done
+
+   The .done file MUST contain:
+   - List of files you modified (with line numbers if applicable)
+   - Summary of changes made to each file
+   - Any tests you ran and their results
+   - If BLOCKED: explain what blocked you and what you tried
+
+### Phase 4: Leave Environment Clean
+1. Do NOT commit - the orchestrator handles commits
+2. Ensure all tests pass
+3. Ensure code is in a working state for the next worker
+
+## Critical Requirements
+- You MUST make actual code changes - reading files is not enough
+- You MUST use Edit/Write tools to modify source code
+- Do NOT create the .done file until you have modified code
+- If you encounter a blocker, document it in .done and explain what prevented completion
+- Keep changes minimal and focused on this single feature
 - NEVER commit, stage, or git add ANY of these files:
   - .claude/ (entire directory - orchestrator state, logs, prompts, worker files)
   - claude-progress.txt
@@ -177,6 +317,7 @@ ${projectContext}
 ${customPrompt ? `\n## Additional Context\n${customPrompt}` : ""}
 
 Begin implementing the feature now.`;
+    }
 
     return prompt;
   }
@@ -307,12 +448,16 @@ Begin exploring and planning now.`;
         this.workerDir,
         `${feature.id}.planner-${role.toLowerCase()}.sh`
       );
+
+      // Get worker flags (tools, permissions, MCP config)
+      const workerFlags = getWorkerFlags();
+
       const scriptContent = `#!/bin/bash
 set -e
 cd ${shellQuote(this.projectDir)}
 PROMPT=$(cat ${shellQuote(promptFile)})
-# Planning mode: only read-only tools plus Write for the plan file
-claude -p "$PROMPT" --allowedTools Read,Glob,Grep,Write 2>&1 | tee ${shellQuote(logFile)}
+# Planner: allowed tools and MCP servers configured via env vars
+claude ${workerFlags} -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
 echo 'PLANNER_EXITED' >> ${shellQuote(logFile)}
 `;
       fs.writeFileSync(wrapperScript, scriptContent, { mode: 0o700 });
@@ -393,7 +538,8 @@ echo 'PLANNER_EXITED' >> ${shellQuote(logFile)}
    */
   async startWorker(
     feature: Feature,
-    customPrompt?: string
+    customPrompt?: string,
+    model?: "haiku" | "sonnet" | "opus"
   ): Promise<StartWorkerResult> {
     // Validate feature ID
     try {
@@ -428,11 +574,17 @@ echo 'PLANNER_EXITED' >> ${shellQuote(logFile)}
       // Create a wrapper script that reads the prompt from file
       // This avoids any shell escaping issues
       const wrapperScript = path.join(this.workerDir, `${feature.id}.sh`);
+
+      // Get worker flags (tools, permissions, MCP config)
+      const workerFlags = getWorkerFlags();
+
+      const modelFlag = model ? `--model claude-${model}-4-5` : "";
       const scriptContent = `#!/bin/bash
 set -e
 cd ${shellQuote(this.projectDir)}
 PROMPT=$(cat ${shellQuote(promptFile)})
-claude -p "$PROMPT" --allowedTools Bash,Read,Write,Edit,Glob,Grep 2>&1 | tee ${shellQuote(logFile)}
+# Worker: allowed tools and MCP servers configured via env vars
+claude ${modelFlag} ${workerFlags} -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
 echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
 `;
       fs.writeFileSync(wrapperScript, scriptContent, { mode: 0o700 });
