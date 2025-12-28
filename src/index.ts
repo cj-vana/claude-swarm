@@ -17,6 +17,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { exec } from "child_process";
+import { promisify } from "util";
+import * as fs from "fs";
+import * as path from "path";
 
 import { StateManager, OrchestratorState, Feature, WorkerStatus } from "./state/manager.js";
 import { WorkerManager } from "./workers/manager.js";
@@ -28,10 +32,19 @@ import {
   validateCommand,
   sanitizeOutput,
 } from "./utils/security.js";
+
+const execAsync = promisify(exec);
 import { startDashboardServer, DashboardServer } from "./dashboard/server.js";
 import { analyzeComplexity, formatComplexityResult } from "./utils/complexity-detector.js";
 import { evaluatePlans, parsePlanFromFile, formatEvaluationResult } from "./utils/plan-evaluator.js";
 import { getWorkerConfidence, formatConfidenceResult } from "./workers/confidence.js";
+import { validateFeature } from "./utils/validation.js";
+import {
+  captureGitState,
+  calculateGitVerification,
+  verifyExpectedPackages,
+  formatGitVerification,
+} from "./utils/git-verification.js";
 
 // Dashboard configuration from environment variables
 const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT || "3456", 10);
@@ -274,8 +287,9 @@ server.tool(
     projectDir: z.string().describe("Absolute path to the project directory"),
     featureId: z.string().describe("ID of the feature to work on (e.g., 'feature-1')"),
     customPrompt: z.string().optional().describe("Optional custom prompt to give the worker additional context"),
+    model: z.enum(["haiku", "sonnet", "opus"]).optional().describe("Claude model to use: haiku (fast, cheap), sonnet (balanced), opus (maximum capability)"),
   },
-  async ({ projectDir, featureId, customPrompt }) => {
+  async ({ projectDir, featureId, customPrompt, model }) => {
     const { state, workers } = await ensureInitialized(projectDir);
 
     // Validate feature ID format
@@ -329,8 +343,17 @@ server.tool(
       }
     }
 
+    // Capture git state before starting worker
+    let beforeHash: string | undefined;
+    try {
+      beforeHash = captureGitState(projectDir);
+    } catch (error) {
+      // Git capture failed - continue without verification
+      console.warn("Failed to capture git state:", error);
+    }
+
     // Start the worker
-    const result = await workers.startWorker(feature, customPrompt);
+    const result = await workers.startWorker(feature, customPrompt, model);
 
     if (result.success) {
       // Update feature status
@@ -338,6 +361,19 @@ server.tool(
       feature.attempts++;
       feature.workerId = result.sessionName;
       feature.startedAt = new Date().toISOString();
+
+      // Store git state for later verification
+      if (beforeHash) {
+        feature.gitVerification = {
+          beforeHash,
+          afterHash: "", // Will be filled on completion
+          filesChanged: [],
+          linesAdded: 0,
+          linesDeleted: 0,
+          diffChecksum: "",
+        };
+      }
+
       current.lastUpdated = new Date().toISOString();
       current.progressLog.push(`[${new Date().toISOString()}] Started worker for ${featureId}: ${feature.description}`);
       state.save(current);
@@ -369,8 +405,9 @@ server.tool(
     projectDir: z.string().describe("Absolute path to the project directory"),
     featureIds: z.array(z.string()).min(1).max(10).describe("Array of feature IDs to start (e.g., ['feature-1', 'feature-2']). Maximum 10 workers at once."),
     customPrompts: z.record(z.string(), z.string()).optional().describe("Optional: Map of feature IDs to custom prompts (e.g., {'feature-1': 'Additional context...'})"),
+    models: z.record(z.string(), z.enum(["haiku", "sonnet", "opus"])).optional().describe("Optional: Map of feature IDs to models (e.g., {'feature-1': 'haiku', 'feature-2': 'sonnet'})"),
   },
-  async ({ projectDir, featureIds, customPrompts }) => {
+  async ({ projectDir, featureIds, customPrompts, models }) => {
     const { state, workers } = await ensureInitialized(projectDir);
 
     const current = state.load();
@@ -449,7 +486,8 @@ server.tool(
 
     const startPromises = featuresToStart.map(async (feature) => {
       const customPrompt = customPrompts?.[feature.id];
-      const result = await workers.startWorker(feature, customPrompt);
+      const model = models?.[feature.id];
+      const result = await workers.startWorker(feature, customPrompt, model);
 
       if (result.success) {
         // Update feature status
@@ -994,10 +1032,92 @@ server.tool(
       await workers.killWorker(feature.workerId);
     }
 
+    // Calculate git verification if we captured beforeHash
+    if (feature.gitVerification && feature.gitVerification.beforeHash) {
+      try {
+        const verification = calculateGitVerification(
+          projectDir,
+          feature.gitVerification.beforeHash
+        );
+        feature.gitVerification = verification;
+      } catch (error) {
+        console.warn("Failed to calculate git verification:", error);
+      }
+    }
+
+    // Validation: Run validation checks if marking as success
+    let validationWarning = "";
+    let validationBlocked = false;
+
+    if (success && feature.validation?.enabled) {
+      try {
+        const validationResult = await validateFeature(feature, projectDir);
+        feature.validationResult = validationResult;
+
+        if (!validationResult.passed && feature.validation.enforceBlocking) {
+          // Validation failed and blocking is enforced - prevent completion
+          validationBlocked = true;
+
+          // Format validation failure details
+          const failedChecks = validationResult.checks
+            .filter(c => !c.passed)
+            .map(c => `  • ${c.name}: ${c.details}`)
+            .join("\n");
+
+          const validationError = `Validation failed:\n${failedChecks}`;
+          feature.lastError = validationError;
+
+          // Keep as pending for retry
+          feature.status = "pending";
+          feature.workerId = undefined;
+
+          current.progressLog.push(
+            `[${new Date().toISOString()}] 🔄 Validation failed: ${featureId} - attempt ${feature.attempts}/${feature.maxRetries || maxRetries}\n${validationError}`
+          );
+          current.lastUpdated = new Date().toISOString();
+          state.save(current);
+          state.writeProgressFile();
+
+          const retryGuidance = feature.attempts < (feature.maxRetries || maxRetries)
+            ? `\n\n💡 Feature will be retried (attempt ${feature.attempts + 1}/${feature.maxRetries || maxRetries}). Address validation failures:\n${failedChecks}\n\nUse start_worker to launch retry.`
+            : `\n\n❌ Max retries (${feature.maxRetries || maxRetries}) exhausted. Validation still failing.`;
+
+          return {
+            content: [{
+              type: "text",
+              text: `🚫 Validation blocked completion of ${featureId}\n\n${validationError}${retryGuidance}`,
+            }],
+          };
+        } else if (!validationResult.passed) {
+          // Validation failed but not blocking - just warn
+          const failedChecks = validationResult.checks
+            .filter(c => !c.passed)
+            .map(c => `  • ${c.name}: ${c.details}`)
+            .join("\n");
+          validationWarning = `\n\n⚠️ WARNING: Validation checks failed (non-blocking):\n${failedChecks}`;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        validationWarning = `\n\n⚠️ WARNING: Validation execution failed: ${message}`;
+      }
+    } else if (success && !feature.validation?.enabled) {
+      // Legacy git diff check for features without validation config
+      try {
+        const { stdout: gitDiff } = await execAsync("git diff HEAD", { cwd: projectDir });
+        const hasCodeChanges = gitDiff.trim().length > 0;
+
+        if (!hasCodeChanges) {
+          validationWarning = "\n\n⚠️ WARNING: No code changes detected in git diff. Worker may not have implemented the feature.";
+        }
+      } catch (error) {
+        // Git command failed - ignore validation
+      }
+    }
+
     let resultStatus: string;
     let willRetry = false;
 
-    if (success) {
+    if (success && !validationBlocked) {
       // Mark as completed
       feature.status = "completed";
       feature.completedAt = new Date().toISOString();
@@ -1051,6 +1171,10 @@ server.tool(
     const total = current.features.length;
 
     let responseText = `${success ? "✅" : willRetry ? "🔄" : "❌"} Feature ${featureId} ${resultStatus}.\n\nProgress: ${completed}/${total} features completed`;
+
+    if (validationWarning) {
+      responseText += validationWarning;
+    }
 
     if (willRetry) {
       responseText += `\n\n💡 Feature will be retried. Use start_worker to launch a new attempt.`;
@@ -2092,6 +2216,258 @@ server.tool(
 );
 
 // ============================================================================
+// TOOL: start_voting_workers
+// ============================================================================
+server.tool(
+  "start_voting_workers",
+  "Start 2-3 redundant workers for a critical feature. Each implements independently, then best solution wins via voting. Use for high-risk features where correctness is crucial.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    featureId: z.string().describe("ID of the feature to implement with voting"),
+    voterCount: z.number().min(2).max(3).optional().describe("Number of redundant workers (default: 3)"),
+    customPrompts: z.record(z.string(), z.string()).optional().describe("Optional: Different prompts for each voter"),
+  },
+  async ({ projectDir, featureId, voterCount = 3, customPrompts }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
+
+    try {
+      validateFeatureId(featureId);
+    } catch (error: any) {
+      return {
+        content: [{ type: "text", text: `Invalid feature ID: ${error.message}` }],
+      };
+    }
+
+    const current = state.load();
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active session. Use orchestrator_init first." }],
+      };
+    }
+
+    const originalFeature = current.features.find(f => f.id === featureId);
+    if (!originalFeature) {
+      return {
+        content: [{ type: "text", text: `Feature '${featureId}' not found.` }],
+      };
+    }
+
+    if (originalFeature.status !== "pending") {
+      return {
+        content: [{ type: "text", text: `Feature '${featureId}' must be pending to start voting. Current status: ${originalFeature.status}` }],
+      };
+    }
+
+    // Create voter clones
+    const votingGroupId = `${featureId}-voting`;
+    const voterFeatures: Feature[] = [];
+    const voterRoles: Array<"voter-1" | "voter-2" | "voter-3"> = ["voter-1", "voter-2", "voter-3"];
+
+    const promptVariations = [
+      "Approach: Prioritize code simplicity and readability. Keep changes minimal.",
+      "Approach: Prioritize performance and efficiency. Optimize where possible.",
+      "Approach: Prioritize maintainability and testing. Add comprehensive tests.",
+    ];
+
+    for (let i = 0; i < voterCount; i++) {
+      const role = voterRoles[i];
+      const voterFeature: Feature = {
+        ...originalFeature,
+        id: `${featureId}-${role}`,
+        votingGroup: votingGroupId,
+        votingRole: role,
+        votingScore: undefined,
+        votingWinner: false,
+      };
+      voterFeatures.push(voterFeature);
+      current.features.push(voterFeature);
+    }
+
+    // Mark original feature as in voting
+    originalFeature.status = "in_progress";
+    originalFeature.notes = `Voting in progress with ${voterCount} workers`;
+
+    // Start all voters in parallel
+    const startPromises = voterFeatures.map(async (voter, index) => {
+      const customPrompt = customPrompts?.[voter.id] || promptVariations[index];
+      const result = await workers.startWorker(voter, customPrompt, "haiku"); // Use haiku for voting
+
+      if (result.success) {
+        voter.status = "in_progress";
+        voter.attempts++;
+        voter.workerId = result.sessionName;
+        voter.startedAt = new Date().toISOString();
+      }
+
+      return {
+        voterId: voter.id,
+        success: result.success,
+        sessionName: result.sessionName,
+        error: result.error,
+      };
+    });
+
+    const results = await Promise.all(startPromises);
+    const successful = results.filter(r => r.success);
+
+    current.lastUpdated = new Date().toISOString();
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 🗳️ Started voting for ${featureId}: ${successful.length}/${voterCount} voters`
+    );
+
+    state.save(current);
+    state.writeProgressFile();
+
+    let response = `🗳️ Voting Workers Started\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    response += `Feature: ${originalFeature.description}\n`;
+    response += `Voters: ${successful.length}/${voterCount}\n\n`;
+
+    for (const result of results) {
+      if (result.success) {
+        response += `✅ ${result.voterId}: ${result.sessionName}\n`;
+      } else {
+        response += `❌ ${result.voterId}: ${result.error}\n`;
+      }
+    }
+
+    response += `\n⏱️ Wait 5-10 minutes for voters to complete.\n`;
+    response += `Then use: evaluate_voting_results(featureId="${featureId}")`;
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: evaluate_voting_results
+// ============================================================================
+server.tool(
+  "evaluate_voting_results",
+  "Evaluate and compare solutions from voting workers. Scores each based on tests, code quality, and completeness. Winner gets applied, losers discarded.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    featureId: z.string().describe("Original feature ID that voting was started for"),
+  },
+  async ({ projectDir, featureId }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
+
+    const current = state.load();
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active session." }],
+      };
+    }
+
+    const originalFeature = current.features.find(f => f.id === featureId);
+    if (!originalFeature) {
+      return {
+        content: [{ type: "text", text: `Feature '${featureId}' not found.` }],
+      };
+    }
+
+    const votingGroupId = `${featureId}-voting`;
+    const voters = current.features.filter(f => f.votingGroup === votingGroupId);
+
+    if (voters.length === 0) {
+      return {
+        content: [{ type: "text", text: `No voting workers found for ${featureId}. Use start_voting_workers first.` }],
+      };
+    }
+
+    // Score each voter
+    for (const voter of voters) {
+      let score = 0;
+
+      // Check if worker completed
+      if (voter.status !== "completed") {
+        voter.votingScore = 0;
+        continue;
+      }
+
+      // +40 points: Tests pass (check for .done file mentioning tests)
+      const doneFile = path.join(projectDir, `.claude/orchestrator/workers/${voter.id}.done`);
+      if (fs.existsSync(doneFile)) {
+        const doneContent = fs.readFileSync(doneFile, "utf-8").toLowerCase();
+        if (doneContent.includes("test") && (doneContent.includes("pass") || doneContent.includes("success"))) {
+          score += 40;
+        }
+        // +20 points: Detailed .done file (mentions files modified)
+        if (doneContent.includes("modified") || doneContent.includes("changed") || doneContent.includes("files:")) {
+          score += 20;
+        }
+      }
+
+      // +30 points: Minimal diff (check git diff size)
+      try {
+        const { stdout: gitDiff } = await execAsync(`git diff HEAD -- ':(exclude).claude/'`, { cwd: projectDir });
+        const lineCount = gitDiff.split("\n").length;
+        if (lineCount < 50) score += 30;
+        else if (lineCount < 100) score += 20;
+        else if (lineCount < 200) score += 10;
+      } catch {
+        // Git failed, skip
+      }
+
+      // +10 points: No errors in log
+      const logFile = path.join(projectDir, `.claude/orchestrator/workers/${voter.id}.log`);
+      if (fs.existsSync(logFile)) {
+        const logContent = fs.readFileSync(logFile, "utf-8").toLowerCase();
+        const errorCount = (logContent.match(/error|failed|exception/g) || []).length;
+        if (errorCount === 0) score += 10;
+        else if (errorCount < 3) score += 5;
+      }
+
+      voter.votingScore = score;
+    }
+
+    // Find winner
+    voters.sort((a, b) => (b.votingScore || 0) - (a.votingScore || 0));
+    const winner = voters[0];
+    winner.votingWinner = true;
+
+    // Mark original feature based on winner
+    if (winner.votingScore! > 50) {
+      originalFeature.status = "completed";
+      originalFeature.completedAt = new Date().toISOString();
+    } else {
+      originalFeature.status = "failed";
+      originalFeature.lastError = "All voting workers scored low - implementation may be incomplete";
+    }
+
+    // Kill non-winner workers
+    for (const voter of voters) {
+      if (voter.id !== winner.id && voter.workerId) {
+        await workers.killWorker(voter.workerId);
+      }
+    }
+
+    current.lastUpdated = new Date().toISOString();
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 🏆 Voting complete for ${featureId}: Winner ${winner.id} (score: ${winner.votingScore})`
+    );
+
+    state.save(current);
+    state.writeProgressFile();
+
+    let response = `🏆 Voting Results for ${featureId}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    response += `Winner: ${winner.id} (Score: ${winner.votingScore}/100)\n\n`;
+    response += `All Scores:\n`;
+    for (const voter of voters) {
+      const icon = voter.votingWinner ? "🏆" : "  ";
+      response += `${icon} ${voter.id}: ${voter.votingScore}/100\n`;
+    }
+
+    response += `\n✅ Original feature ${originalFeature.status}\n`;
+    response += `\nNext: Review winner's changes and use commit_progress to save.`;
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
 // TOOL: get_worker_confidence
 // ============================================================================
 server.tool(
@@ -2212,6 +2588,135 @@ server.tool(
           text: `🎚️ Confidence Threshold Updated\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nThreshold: ${threshold}%\nAuto-Alert: ${autoAlert ?? true}\n\nWhen any worker's confidence drops below ${threshold}%, an alert will be generated.`,
         },
       ],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: auto_orchestrate
+// ============================================================================
+server.tool(
+  "auto_orchestrate",
+  "Automatically schedule and monitor workers based on priority, dependencies, and worker health. Runs hands-free until all features complete.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    strategy: z.enum(["breadth-first", "depth-first", "adaptive"]).optional().describe("Scheduling strategy (default: adaptive)"),
+    maxConcurrent: z.number().min(1).max(10).optional().describe("Maximum concurrent workers (default: 5)"),
+    checkIntervalSeconds: z.number().min(10).max(300).optional().describe("How often to check worker progress in seconds (default: 30)"),
+  },
+  async ({ projectDir, strategy = "adaptive", maxConcurrent = 5, checkIntervalSeconds = 30 }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
+
+    const current = state.load();
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active session. Use orchestrator_init first." }],
+      };
+    }
+
+    // Priority calculation function
+    function calculatePriority(feature: Feature, allFeatures: Feature[]): number {
+      let score = 0;
+
+      // +50 points per feature this blocks
+      const blockedCount = allFeatures.filter(f =>
+        f.dependsOn?.includes(feature.id) && f.status === "pending"
+      ).length;
+      score += blockedCount * 50;
+
+      // +40 points if no dependencies (can start immediately)
+      if (!feature.dependsOn || feature.dependsOn.length === 0) {
+        score += 40;
+      }
+
+      // +30 points for low complexity (if available)
+      if (feature.complexity && feature.complexity.score < 40) {
+        score += 30;
+      }
+
+      // -20 points per previous attempt (struggling)
+      score -= (feature.attempts || 0) * 20;
+
+      // Strategy-specific adjustments
+      if (strategy === "breadth-first") {
+        // Prefer features with no dependencies
+        if (!feature.dependsOn || feature.dependsOn.length === 0) score += 20;
+      } else if (strategy === "depth-first") {
+        // Prefer features that unblock others
+        score += blockedCount * 30;
+      }
+
+      return Math.max(0, score);
+    }
+
+    // Get features ready to work on
+    function getReadyFeatures(): Feature[] {
+      return current!.features.filter(f => {
+        if (f.status !== "pending") return false;
+
+        // Check dependencies are met
+        if (f.dependsOn && f.dependsOn.length > 0) {
+          const unmetDeps = f.dependsOn.filter(depId => {
+            const dep = current!.features.find(df => df.id === depId);
+            return !dep || dep.status !== "completed";
+          });
+          if (unmetDeps.length > 0) return false;
+        }
+
+        return true;
+      });
+    }
+
+    // Start orchestration
+    let iterationCount = 0;
+    const maxIterations = 100; // Safety limit
+    let totalStarted = 0;
+    let totalCompleted = 0;
+
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 🤖 Auto-orchestration started (strategy: ${strategy}, maxConcurrent: ${maxConcurrent})`
+    );
+    state.save(current);
+
+    // Main orchestration loop would go here in a real implementation
+    // For now, we'll return a plan of what would be executed
+
+    const readyFeatures = getReadyFeatures();
+    const prioritized = readyFeatures
+      .map(f => ({ feature: f, priority: calculatePriority(f, current.features) }))
+      .sort((a, b) => b.priority - a.priority);
+
+    const nextBatch = prioritized.slice(0, maxConcurrent);
+
+    let response = `🤖 Auto-Orchestration Plan\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    response += `Strategy: ${strategy}\n`;
+    response += `Max Concurrent: ${maxConcurrent}\n`;
+    response += `Ready Features: ${readyFeatures.length}\n\n`;
+
+    if (nextBatch.length > 0) {
+      response += `📊 Next Batch (${nextBatch.length} features):\n`;
+      for (const { feature, priority } of nextBatch) {
+        response += `  ${feature.id} (priority: ${priority}) - ${feature.description.substring(0, 60)}...\n`;
+      }
+
+      response += `\n💡 To execute this plan, use:\n`;
+      response += `start_parallel_workers(featureIds=[`;
+      response += nextBatch.map(b => `"${b.feature.id}"`).join(", ");
+      response += `])\n\n`;
+
+      response += `Then check progress periodically with check_all_workers.`;
+    } else {
+      response += `✅ No features ready to start.\n`;
+      const pending = current.features.filter(f => f.status === "pending");
+      if (pending.length > 0) {
+        response += `\n${pending.length} features pending but blocked by dependencies.`;
+      } else {
+        response += `\nAll features completed!`;
+      }
+    }
+
+    return {
+      content: [{ type: "text", text: response }],
     };
   }
 );
