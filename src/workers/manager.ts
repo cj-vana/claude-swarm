@@ -64,14 +64,14 @@ function getWorkerFlags(): string {
   const flags: string[] = [];
 
   // Explicitly allow specific tools (bypasses permission prompts for these)
-  flags.push(`--allowedTools "${allowedTools}"`);
+  flags.push(`--allowedTools ${shellQuote(allowedTools)}`);
 
   // Set permission mode (bypassPermissions for headless workers)
-  flags.push(`--permission-mode ${permissionMode}`);
+  flags.push(`--permission-mode ${shellQuote(permissionMode)}`);
 
   // Use inline MCP config with specified servers (empty by default)
   const mcpConfig = JSON.stringify({ mcpServers });
-  flags.push(`--mcp-config '${mcpConfig}'`);
+  flags.push(`--mcp-config ${shellQuote(mcpConfig)}`);
 
   return flags.join(" ");
 }
