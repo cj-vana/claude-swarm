@@ -41,20 +41,12 @@ export function calculateGitVerification(
     // If afterHash not provided, compare beforeHash to current working tree
     const compareTarget = afterHash || "HEAD";
 
-    // Get diff statistics
-    const diffStat = execSync(
-      `git diff ${beforeHash}${afterHash ? `.${afterHash}` : ""} --numstat`,
-      {
-        cwd: projectDir,
+      `git diff ${beforeHash}..${compareTarget} --numstat`,
         encoding: "utf-8",
       }
     );
 
-    // Get list of changed files
-    const filesChanged = execSync(
-      `git diff ${beforeHash}${afterHash ? `.${afterHash}` : ""} --name-only`,
-      {
-        cwd: projectDir,
+      `git diff ${beforeHash}..${compareTarget} --name-only`,
         encoding: "utf-8",
       }
     )

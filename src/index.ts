@@ -2399,7 +2399,8 @@ server.tool(
       }
 
         const { stdout: gitDiff } = await execAsync(`git diff HEAD -- . ':(exclude).claude/'`, { cwd: projectDir });
-        else if (lineCount < 100) score += 20;
+        const lineCount = gitDiff.trim().split("\n").length;
+        if (lineCount < 100) score += 20;
         else if (lineCount < 200) score += 10;
       } catch {
         // Git failed, skip
