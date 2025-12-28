@@ -506,9 +506,8 @@ describe('plan-evaluator module', () => {
 
       const result = evaluatePlans(feature, planA, planB, mockProjectDir);
 
-      if (result.marginOfVictory >= 15) {
-        expect(result.selectionReason).toContain('clearly superior');
-      }
+      expect(result.marginOfVictory).toBeGreaterThanOrEqual(15);
+      expect(result.selectionReason).toContain('clearly superior');
     });
   });
 
