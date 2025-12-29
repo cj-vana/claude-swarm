@@ -2398,6 +2398,8 @@ server.tool(
         }
       }
 
+      // +20 points: Reasonable change size (not too big)
+      try {
         const { stdout: gitDiff } = await execAsync(`git diff HEAD -- . ':(exclude).claude/'`, { cwd: projectDir });
         const lineCount = gitDiff.trim().split("\n").length;
         if (lineCount < 100) score += 20;

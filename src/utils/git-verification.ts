@@ -41,12 +41,27 @@ export function calculateGitVerification(
     // If afterHash not provided, compare beforeHash to current working tree
     const compareTarget = afterHash || "HEAD";
 
+    // Validate git hashes to prevent injection (40-char hex strings only)
+    const hashRegex = /^[a-f0-9]{40}$/;
+    if (!hashRegex.test(beforeHash)) {
+      throw new Error(`Invalid beforeHash: ${beforeHash}`);
+    }
+    if (afterHash && !hashRegex.test(afterHash)) {
+      throw new Error(`Invalid afterHash: ${afterHash}`);
+    }
+
+    const diffStat = execSync(
       `git diff ${beforeHash}..${compareTarget} --numstat`,
+      {
+        cwd: projectDir,
         encoding: "utf-8",
       }
     );
 
+    const filesChanged = execSync(
       `git diff ${beforeHash}..${compareTarget} --name-only`,
+      {
+        cwd: projectDir,
         encoding: "utf-8",
       }
     )
@@ -73,7 +88,7 @@ export function calculateGitVerification(
 
     // Get full diff for checksum
     const fullDiff = execSync(
-      `git diff ${beforeHash}${afterHash ? `.${afterHash}` : ""}`,
+      `git diff ${beforeHash}..${compareTarget}`,
       {
         cwd: projectDir,
         encoding: "utf-8",
