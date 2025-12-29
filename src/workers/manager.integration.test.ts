@@ -8,6 +8,22 @@ import { promisify } from "util";
 
 const execFileAsync = promisify(execFile);
 
+
+// Polling utility for reliable async waits
+const pollWithTimeout = async (
+  condition: () => Promise<boolean>,
+  timeout: number = 5000,
+  interval: number = 50
+): Promise<void> => {
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeout) {
+    if (await condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+  throw new Error(`Condition not met within ${timeout}ms`);
+};
+
+
 // Integration tests that actually use tmux
 describe("WorkerManager Integration Tests", () => {
   let workerManager: WorkerManager;
@@ -144,7 +160,11 @@ describe("WorkerManager Integration Tests", () => {
         activeSessions.push(startResult.sessionName);
 
         // Give worker a moment to initialize
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        await pollWithTimeout(
+          async () => (await workerManager.checkWorker(startResult.sessionName)).status === 'running',
+          5000,
+          100
+        );
 
         const checkResult = await workerManager.checkWorker(
           startResult.sessionName
@@ -177,7 +197,18 @@ describe("WorkerManager Integration Tests", () => {
         await workerManager.killWorker(startResult.sessionName);
 
         // Give tmux a moment to process
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await pollWithTimeout(
+          async () => {
+            try {
+              await execFileAsync('tmux', ['list-sessions']);
+              return true; // Session processed
+            } catch {
+              return false; // No sessions yet
+            }
+          },
+          5000,
+          50
+        );
 
         // Verify session is gone
         try {
@@ -220,7 +251,18 @@ describe("WorkerManager Integration Tests", () => {
 
         // Kill the session to simulate worker exit
         await workerManager.killWorker(startResult.sessionName);
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await pollWithTimeout(
+          async () => {
+            try {
+              await execFileAsync('tmux', ['list-sessions']);
+              return true;
+            } catch {
+              return false;
+            }
+          },
+          5000,
+          50
+        );
 
         // Check status
         const checkResult = await workerManager.checkWorker(
@@ -253,7 +295,18 @@ describe("WorkerManager Integration Tests", () => {
 
         // Kill session without creating done file
         await workerManager.killWorker(startResult.sessionName);
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await pollWithTimeout(
+          async () => {
+            try {
+              await execFileAsync('tmux', ['list-sessions']);
+              return true;
+            } catch {
+              return false;
+            }
+          },
+          5000,
+          50
+        );
 
         const checkResult = await workerManager.checkWorker(
           startResult.sessionName
