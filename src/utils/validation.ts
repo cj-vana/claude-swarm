@@ -16,6 +16,7 @@ import {
   ValidationCheck,
 } from "../state/manager.js";
 import { verifyExpectedPackages } from "./git-verification.js";
+import { validateCommand, sanitizeOutput } from "./security.js";
 
 /**
  * Validate a feature's completion criteria
@@ -115,7 +116,18 @@ async function measureCoverage(
     // Determine coverage command
     let command: string;
     if (verifyCommand) {
-      command = verifyCommand;
+      // Validate custom command to prevent injection
+      try {
+        command = validateCommand(verifyCommand);
+      } catch (error) {
+        return {
+          name: "coverage",
+          passed: false,
+          expected: targetCoverage,
+          actual: 0,
+          details: `Invalid verification command: command not in allowed list`,
+        };
+      }
     } else if (expectedPackages && expectedPackages.length > 0) {
       // Default: go test -cover for specified packages
       const packages = expectedPackages.join(" ");
@@ -148,12 +160,13 @@ async function measureCoverage(
   } catch (error) {
     const message =
       error instanceof Error ? error.message : String(error);
+    // Sanitize error details to prevent information disclosure
     return {
       name: "coverage",
       passed: false,
       expected: targetCoverage,
       actual: 0,
-      details: `Coverage measurement failed: ${message}`,
+      details: `Coverage measurement failed (see logs for details)`,
     };
   }
 }
@@ -170,7 +183,16 @@ async function runTests(
     // Determine test command
     let command: string;
     if (verifyCommand) {
-      command = verifyCommand;
+      // Validate custom command to prevent injection
+      try {
+        command = validateCommand(verifyCommand);
+      } catch (error) {
+        return {
+          name: "tests",
+          passed: false,
+          details: `Invalid verification command: command not in allowed list`,
+        };
+      }
     } else if (expectedPackages && expectedPackages.length > 0) {
       const packages = expectedPackages.join(" ");
       command = `go test ${packages}`;
@@ -198,12 +220,11 @@ async function runTests(
         : `Tests failed - see output`,
     };
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : String(error);
+    // Sanitize error details to prevent information disclosure
     return {
       name: "tests",
       passed: false,
-      details: `Test execution failed: ${message}`,
+      details: `Test execution failed (see logs for details)`,
     };
   }
 }
