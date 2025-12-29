@@ -71,13 +71,22 @@ export async function startDashboardServer(
   // Send SSE event to all connected clients
   const broadcastSSE = (eventType: string, data: unknown) => {
     const message = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
-    sseClients.forEach((client) => {
+    const aliveClients: SSEClient[] = [];
+    
+    for (let i = sseClients.length - 1; i >= 0; i--) {
+      const client = sseClients[i];
       try {
         client.res.write(message);
+        aliveClients.push(client);
       } catch (err) {
-        // Client disconnected, will be cleaned up
+        // Client disconnected - remove from array
+        console.log(`SSE client disconnected during broadcast: ${client.id}`);
       }
-    });
+    }
+    
+    // Replace with only alive clients
+    sseClients.length = 0;
+    sseClients.push(...aliveClients);
   };
 
   // Create a snapshot of current state for change detection
@@ -190,6 +199,44 @@ export async function startDashboardServer(
     }, 1000); // Check every 1 second
   };
 
+// Simple rate limiting middleware (in-memory, per IP)
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+
+function createRateLimitMiddleware(maxRequests: number, windowMs: number) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const ip = req.ip || 'unknown';
+    const now = Date.now();
+    const record = rateLimitMap.get(ip);
+    
+    if (!record || now > record.resetTime) {
+      // New window
+      rateLimitMap.set(ip, { count: 1, resetTime: now + windowMs });
+      return next();
+    }
+    
+    if (record.count >= maxRequests) {
+      return res.status(429).json({
+        error: "Too many requests",
+        message: `Rate limit exceeded. Maximum ${maxRequests} requests per ${windowMs / 1000}s.`,
+        retryAfter: Math.ceil((record.resetTime - now) / 1000),
+      });
+    }
+    
+    record.count++;
+    next();
+  };
+}
+
+// Clean up expired rate limit records periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of rateLimitMap.entries()) {
+    if (now > record.resetTime) {
+      rateLimitMap.delete(ip);
+    }
+  }
+}, 60000); // Cleanup every minute
+
   // CORS middleware for local development
   app.use((req: Request, res: Response, next: NextFunction) => {
     res.header("Access-Control-Allow-Origin", "*");
@@ -201,6 +248,9 @@ export async function startDashboardServer(
     }
     next();
   });
+
+  // Apply rate limiting to all API endpoints (except SSE)
+  app.use("/api/", createRateLimitMiddleware(100, 60000)); // 100 requests per minute
 
   // Serve static files from the public directory
   // In dev: src/dashboard/public, in dist: dist/dashboard/public
@@ -487,9 +537,27 @@ export async function startDashboardServer(
         await sendOutput();
       }, 2000);
 
-      // Handle client disconnect
+      // Handle client disconnect - aggressive cleanup
       req.on("close", () => {
         clearInterval(outputInterval);
+        
+        try {
+          res.end();
+        } catch (err) {
+          // Response may already be closed
+        }
+      });
+      
+      // Handle client errors
+      req.on("error", (err) => {
+        console.error(`Worker SSE client error for ${featureId}:`, err);
+        clearInterval(outputInterval);
+        try {
+          res.end();
+        } catch (endErr) {
+          // Response may already be closed
+          }
+        }
       });
     })
   );
@@ -687,14 +755,40 @@ export async function startDashboardServer(
       }
     }, 30000);
 
-    // Handle client disconnect
+    // Handle client disconnect - aggressive cleanup
     req.on("close", () => {
       clearInterval(heartbeatInterval);
+      
+      // Remove from sseClients array immediately
+      const index = sseClients.findIndex((c) => c.id === clientId);
+      if (index !== -1) {
+        sseClients.splice(index, 1);
+        console.log(`SSE client disconnected: ${clientId} (remaining: ${sseClients.length})`);
+      }
+      
+      // Also clear any cached interval for this client
+      try {
+        res.end();
+      } catch (err) {
+        // Response may already be closed
+      }
+    });
+    
+    // Handle client errors - also trigger cleanup
+    req.on("error", (err) => {
+      console.error(`SSE client error: ${clientId}:`, err);
+      clearInterval(heartbeatInterval);
+      
       const index = sseClients.findIndex((c) => c.id === clientId);
       if (index !== -1) {
         sseClients.splice(index, 1);
       }
-      console.log(`SSE client disconnected: ${clientId} (remaining: ${sseClients.length})`);
+      
+      try {
+        res.end();
+      } catch (endErr) {
+        // Response may already be closed
+      }
     });
   });
 

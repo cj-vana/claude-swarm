@@ -183,15 +183,22 @@ export function validateCommand(command: string): string {
 }
 
 /**
+ * Escape special regex characters in a string for safe use in RegExp
+ */
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
  * Sanitize a string for safe display in output
  * Removes sensitive paths and truncates
  */
 export function sanitizeOutput(output: string, maxLength: number = 5000): string {
   let sanitized = output;
 
-  // Remove home directory paths
+  // Remove home directory paths (escape regex special chars first)
   const homeDir = os.homedir();
-  sanitized = sanitized.replace(new RegExp(homeDir, "g"), "~");
+  sanitized = sanitized.replace(new RegExp(escapeRegExp(homeDir), "g"), "~");
 
   // Truncate if too long
   if (sanitized.length > maxLength) {

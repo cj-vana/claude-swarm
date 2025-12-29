@@ -40,6 +40,38 @@ const ENABLE_DASHBOARD = process.env.ENABLE_DASHBOARD !== "false"; // Default: t
 // Dashboard server instance (started when first project is initialized)
 let dashboardServer: DashboardServer | null = null;
 
+// Cleanup function for graceful shutdown
+async function cleanup(): Promise<void> {
+  console.error("Shutting down gracefully...");
+  
+  // Stop worker completion monitor to prevent memory leaks
+  if (workerManager) {
+    workerManager.stopCompletionMonitor();
+  }
+  
+  // Close dashboard server
+  if (dashboardServer) {
+    await dashboardServer.close();
+  }
+  
+  console.error("Shutdown complete");
+}
+
+// Handle shutdown signals
+process.on("SIGTERM", () => {
+  cleanup().then(() => process.exit(0)).catch((err) => {
+    console.error("Error during shutdown:", err);
+    process.exit(1);
+  });
+});
+
+process.on("SIGINT", () => {
+  cleanup().then(() => process.exit(0)).catch((err) => {
+    console.error("Error during shutdown:", err);
+    process.exit(1);
+  });
+});
+
 // Initialize MCP server
 const server = new McpServer({
   name: "claude-swarm",
@@ -2225,7 +2257,8 @@ async function main() {
   console.error("Claude Orchestrator MCP Server running");
 }
 
-main().catch((error) => {
+main().catch(async (error) => {
   console.error("Fatal error:", error);
+  await cleanup();
   process.exit(1);
 });

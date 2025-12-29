@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "tsc && cp -r src/dashboard/public dist/dashboard/",
+    "test": "vitest run",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
     "inspector": "npx @anthropics/mcp-inspector node dist/index.js"
@@ -32,6 +33,9 @@
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^22.0.0",
-    "typescript": "^5.7.0"
+    "@vitest/coverage-v8": "^4.0.16",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.16"
   }
 }

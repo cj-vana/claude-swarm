@@ -1,15 +1,15 @@
 # Claude Swarm TODO.md
 Local improvements and cleanup tasks
 
-## 🐛 Critical Issues
+## ✅ Completed
 
 ### Resource Management
-- [ ] WorkerManager: Clean up `monitorInterval` on server shutdown
-- [ ] Dashboard: More aggressive SSE client cleanup on disconnects
+- [x] WorkerManager: Clean up `monitorInterval` on server shutdown
+- [x] Dashboard: More aggressive SSE client cleanup on disconnects
 
 ### Security
-- [ ] `sanitizeOutput()`: Escape regex special chars in home dir replacement
-- [ ] Dashboard: Add rate limiting to API endpoints
+- [x] `sanitizeOutput()`: Escape regex special chars in home dir replacement
+- [x] Dashboard: Add rate limiting to API endpoints
 
 ## 🧪 Testing Gaps
 ```
