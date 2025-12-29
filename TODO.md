@@ -33,7 +33,7 @@ Inconsistent patterns:
 ## 🚀 Enhancements
 ```
 Nice-to-haves:
-[ ] Graceful shutdown handler (SIGTERM/SIGINT)
+[x] Graceful shutdown handler (SIGTERM/SIGINT)
 [ ] Integration tests with MCP inspector
 [ ] E2E tests for full worker lifecycle
 [ ] Health check endpoints for workers
@@ -54,8 +54,6 @@ Verify all 6 PRs are merge-ready:
 ```
 
 ## Next Actions
-1. Run `npm install` (tsc missing)
-2. Add missing tests
-3. Fix resource leaks
-4. Standardize error handling
-5. Push remaining PRs to merge
+1. Add missing tests (testing gaps remain)
+2. Standardize error handling (Result<T, Error> pattern)
+3. Push remaining PRs to merge (PR #10-14 still open)
