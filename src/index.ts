@@ -42,6 +42,12 @@ import { getProposalManager, ProposalManager, type ProtocolProposal } from "./pr
 import { getBaseConstraints } from "./protocols/base-constraints.js";
 import type { BaseConstraints } from "./protocols/schema.js";
 import { SetupManager } from "./setup/manager.js";
+import { validateFeature } from "./utils/validation.js";
+import {
+  captureGitState,
+  calculateGitVerification,
+  formatGitVerification,
+} from "./utils/git-verification.js";
 
 // Dashboard configuration from environment variables
 const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT || "3456", 10);
@@ -447,6 +453,22 @@ server.tool(
       }
     }
 
+    // Capture git state before worker starts (for verification)
+    try {
+      const beforeHash = captureGitState(projectDir);
+      feature.gitVerification = {
+        beforeHash,
+        afterHash: "",
+        filesChanged: [],
+        linesAdded: 0,
+        linesDeleted: 0,
+        diffChecksum: "",
+      };
+    } catch (error) {
+      // Git state capture is optional - continue without it
+      console.warn("Failed to capture git state:", error);
+    }
+
     // Start the worker
     const result = await workers.startWorker(feature, customPrompt);
 
@@ -565,7 +587,27 @@ server.tool(
       error?: string;
     }> = [];
 
+    // Capture git state once for all workers (they start from same point)
+    let beforeHash: string | undefined;
+    try {
+      beforeHash = captureGitState(projectDir);
+    } catch (error) {
+      console.warn("Failed to capture git state:", error);
+    }
+
     const startPromises = featuresToStart.map(async (feature) => {
+      // Set git verification if we captured state
+      if (beforeHash) {
+        feature.gitVerification = {
+          beforeHash,
+          afterHash: "",
+          filesChanged: [],
+          linesAdded: 0,
+          linesDeleted: 0,
+          diffChecksum: "",
+        };
+      }
+
       const customPrompt = customPrompts?.[feature.id];
       const result = await workers.startWorker(feature, customPrompt);
 
@@ -1161,10 +1203,80 @@ server.tool(
       feature.modifiedFiles = modifiedFiles;
     }
 
+    // Calculate git verification if we captured beforeHash
+    if (feature.gitVerification && feature.gitVerification.beforeHash) {
+      try {
+        const verification = calculateGitVerification(
+          projectDir,
+          feature.gitVerification.beforeHash
+        );
+        feature.gitVerification = verification;
+      } catch (error) {
+        console.warn("Failed to calculate git verification:", error);
+      }
+    }
+
+    // Validation: Run validation checks if marking as success
+    let validationWarning = "";
+    let validationBlocked = false;
+
+    if (success && feature.validation?.enabled) {
+      try {
+        const validationResult = await validateFeature(feature, projectDir);
+        feature.validationResult = validationResult;
+
+        if (!validationResult.passed && feature.validation.enforceBlocking) {
+          // Validation failed and blocking is enforced - prevent completion
+          validationBlocked = true;
+
+          // Format validation failure details
+          const failedChecks = validationResult.checks
+            .filter(c => !c.passed)
+            .map(c => `  • ${c.name}: ${c.details}`)
+            .join("\n");
+
+          const validationError = `Validation failed:\n${failedChecks}`;
+          feature.lastError = validationError;
+
+          // Keep as pending for retry
+          feature.status = "pending";
+          feature.workerId = undefined;
+
+          current.progressLog.push(
+            `[${new Date().toISOString()}] 🔄 Validation failed: ${featureId} - attempt ${feature.attempts}/${feature.maxRetries || maxRetries}\n${validationError}`
+          );
+          current.lastUpdated = new Date().toISOString();
+          state.save(current);
+          state.writeProgressFile();
+
+          const retryGuidance = feature.attempts < (feature.maxRetries || maxRetries)
+            ? `\n\n💡 Feature will be retried (attempt ${feature.attempts + 1}/${feature.maxRetries || maxRetries}). Address validation failures:\n${failedChecks}\n\nUse start_worker to launch retry.`
+            : `\n\n❌ Max retries (${feature.maxRetries || maxRetries}) exhausted. Validation still failing.`;
+
+          return {
+            content: [{
+              type: "text",
+              text: `🚫 Validation blocked completion of ${featureId}\n\n${validationError}${retryGuidance}`,
+            }],
+          };
+        } else if (!validationResult.passed) {
+          // Validation failed but not blocking - just warn
+          const failedChecks = validationResult.checks
+            .filter(c => !c.passed)
+            .map(c => `  • ${c.name}: ${c.details}`)
+            .join("\n");
+          validationWarning = `\n\n⚠️ WARNING: Validation checks failed (non-blocking):\n${failedChecks}`;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        validationWarning = `\n\n⚠️ WARNING: Validation execution failed: ${message}`;
+      }
+    }
+
     let resultStatus: string;
     let willRetry = false;
 
-    if (success) {
+    if (success && !validationBlocked) {
       // Mark as completed
       feature.status = "completed";
       feature.completedAt = new Date().toISOString();
@@ -1255,6 +1367,11 @@ server.tool(
     const total = current.features.length;
 
     let responseText = `${success ? "✅" : willRetry ? "🔄" : "❌"} Feature ${featureId} ${resultStatus}.\n\nProgress: ${completed}/${total} features completed`;
+
+    // Add validation warning if present
+    if (validationWarning) {
+      responseText += validationWarning;
+    }
 
     if (willRetry) {
       responseText += `\n\n💡 Feature will be retried. Use start_worker to launch a new attempt.`;
