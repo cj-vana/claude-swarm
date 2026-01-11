@@ -389,21 +389,24 @@ Begin exploring and planning now.`;
         `${feature.id}.planner-${role.toLowerCase()}.log`
       );
 
-      // Create wrapper script with read-only tools only
+      // Create wrapper script with read-only tools only (planners don't need Bash)
       const wrapperScript = path.join(
         this.workerDir,
         `${feature.id}.planner-${role.toLowerCase()}.sh`
       );
+      // Planners get restricted tools (Read, Glob, Grep, Write for plan file - no Bash)
+      const plannerFlags = getWorkerFlags("Read,Glob,Grep,Write");
       const scriptContent = `#!/bin/bash
 set -e
 cd ${shellQuote(this.projectDir)}
 PROMPT=$(cat ${shellQuote(promptFile)})
 # Prefer claude-code for Max plan compatibility (uses session auth, not API credits)
 # Falls back to claude (API mode) if claude-code is unavailable
+# Planner tools restricted to Read,Glob,Grep,Write (no Bash for security)
 if command -v claude-code &> /dev/null; then
-  claude-code -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
+  claude-code ${plannerFlags} -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
 else
-  claude -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
+  claude ${plannerFlags} -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
 fi
 echo 'PLANNER_EXITED' >> ${shellQuote(logFile)}
 `;
