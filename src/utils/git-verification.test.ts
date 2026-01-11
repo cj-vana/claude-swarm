@@ -33,11 +33,11 @@ describe('git-verification module', () => {
   describe('captureGitState', () => {
     it('should capture current git hash', () => {
       const mockExecSync = vi.mocked(childProcess.execSync);
-      mockExecSync.mockReturnValue('abc123def456789' as any);
+      mockExecSync.mockReturnValue('a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2d1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2789' as any);
 
       const hash = captureGitState('/test/project');
 
-      expect(hash).toBe('abc123def456789');
+      expect(hash).toBe('a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2d1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2789');
       expect(mockExecSync).toHaveBeenCalledWith(
         'git rev-parse HEAD',
         expect.objectContaining({ cwd: '/test/project', encoding: 'utf-8' })
@@ -46,11 +46,11 @@ describe('git-verification module', () => {
 
     it('should trim whitespace from git output', () => {
       const mockExecSync = vi.mocked(childProcess.execSync);
-      mockExecSync.mockReturnValue('  abc123def456789\n' as any);
+      mockExecSync.mockReturnValue('  a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2d1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2789\n' as any);
 
       const hash = captureGitState('/test/project');
 
-      expect(hash).toBe('abc123def456789');
+      expect(hash).toBe('a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2d1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2789');
     });
 
     it('should throw error when git command fails', () => {
@@ -85,12 +85,12 @@ describe('git-verification module', () => {
 
       const verification = calculateGitVerification(
         '/test/project',
-        'abc123',
-        'def456'
+        'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+        'd1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2'
       );
 
-      expect(verification.beforeHash).toBe('abc123');
-      expect(verification.afterHash).toBe('def456');
+      expect(verification.beforeHash).toBe('a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2');
+      expect(verification.afterHash).toBe('d1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2');
       expect(verification.filesChanged).toEqual([
         'internal/agent/agent.go',
         'internal/tools/bash.go',
@@ -113,15 +113,15 @@ describe('git-verification module', () => {
       mockExecSync.mockReturnValueOnce('diff content' as any);
 
       // Mock git rev-parse HEAD for afterHash
-      mockExecSync.mockReturnValueOnce('current-head-hash' as any);
+      mockExecSync.mockReturnValueOnce('c1d2e3f4a5b6c1d2e3f4a5b6c1d2e3f4a5b6c1d2' as any);
 
       const verification = calculateGitVerification(
         '/test/project',
-        'abc123'
+        'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2'
       );
 
-      expect(verification.beforeHash).toBe('abc123');
-      expect(verification.afterHash).toBe('current-head-hash');
+      expect(verification.beforeHash).toBe('a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2');
+      expect(verification.afterHash).toBe('c1d2e3f4a5b6c1d2e3f4a5b6c1d2e3f4a5b6c1d2');
     });
 
     it('should handle binary files with - markers', () => {
@@ -139,11 +139,11 @@ describe('git-verification module', () => {
       mockExecSync.mockReturnValueOnce('diff content' as any);
 
       // Mock HEAD hash
-      mockExecSync.mockReturnValueOnce('def456' as any);
+      mockExecSync.mockReturnValueOnce('d1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2' as any);
 
       const verification = calculateGitVerification(
         '/test/project',
-        'abc123'
+        'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2'
       );
 
       expect(verification.linesAdded).toBe(10); // Only counts file.go
@@ -164,11 +164,11 @@ describe('git-verification module', () => {
       mockExecSync.mockReturnValueOnce('' as any);
 
       // Mock HEAD hash
-      mockExecSync.mockReturnValueOnce('def456' as any);
+      mockExecSync.mockReturnValueOnce('d1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2' as any);
 
       const verification = calculateGitVerification(
         '/test/project',
-        'abc123'
+        'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2'
       );
 
       expect(verification.filesChanged).toEqual([]);
@@ -191,11 +191,11 @@ describe('git-verification module', () => {
       mockExecSync.mockReturnValueOnce(testDiff as any);
 
       // Mock HEAD hash
-      mockExecSync.mockReturnValueOnce('def456' as any);
+      mockExecSync.mockReturnValueOnce('d1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2' as any);
 
       const verification = calculateGitVerification(
         '/test/project',
-        'abc123'
+        'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2'
       );
 
       // Calculate expected checksum
@@ -214,7 +214,7 @@ describe('git-verification module', () => {
       });
 
       expect(() =>
-        calculateGitVerification('/test/project', 'abc123', 'def456')
+        calculateGitVerification('/test/project', 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2', 'd1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2')
       ).toThrow('Failed to calculate git verification');
     });
 
@@ -229,11 +229,11 @@ describe('git-verification module', () => {
       mockExecSync.mockReturnValueOnce(numstatLines as any);
       mockExecSync.mockReturnValueOnce(nameOnlyLines as any);
       mockExecSync.mockReturnValueOnce('diff content' as any);
-      mockExecSync.mockReturnValueOnce('def456' as any);
+      mockExecSync.mockReturnValueOnce('d1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2' as any);
 
       const verification = calculateGitVerification(
         '/test/project',
-        'abc123'
+        'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2'
       );
 
       expect(verification.filesChanged).toHaveLength(100);
@@ -245,8 +245,8 @@ describe('git-verification module', () => {
   describe('verifyExpectedPackages', () => {
     it('should match when files are in expected packages', () => {
       const verification: GitVerification = {
-        beforeHash: 'abc123',
-        afterHash: 'def456',
+        beforeHash: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+        afterHash: 'd1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2',
         filesChanged: [
           'internal/agent/agent.go',
           'internal/agent/coordinator.go',
@@ -267,8 +267,8 @@ describe('git-verification module', () => {
 
     it('should not match when files are not in expected packages', () => {
       const verification: GitVerification = {
-        beforeHash: 'abc123',
-        afterHash: 'def456',
+        beforeHash: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+        afterHash: 'd1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2',
         filesChanged: ['internal/db/models.go', 'internal/tui/tui.go'],
         linesAdded: 50,
         linesDeleted: 10,
@@ -287,8 +287,8 @@ describe('git-verification module', () => {
 
     it('should match partial files', () => {
       const verification: GitVerification = {
-        beforeHash: 'abc123',
-        afterHash: 'def456',
+        beforeHash: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+        afterHash: 'd1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2',
         filesChanged: [
           'internal/agent/agent.go',
           'internal/db/models.go',
@@ -307,8 +307,8 @@ describe('git-verification module', () => {
 
     it('should return true when no packages specified', () => {
       const verification: GitVerification = {
-        beforeHash: 'abc123',
-        afterHash: 'def456',
+        beforeHash: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+        afterHash: 'd1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2',
         filesChanged: ['any/file.go'],
         linesAdded: 50,
         linesDeleted: 10,
@@ -323,8 +323,8 @@ describe('git-verification module', () => {
 
     it('should handle empty file changes', () => {
       const verification: GitVerification = {
-        beforeHash: 'abc123',
-        afterHash: 'def456',
+        beforeHash: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+        afterHash: 'd1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2',
         filesChanged: [],
         linesAdded: 0,
         linesDeleted: 0,
@@ -340,8 +340,8 @@ describe('git-verification module', () => {
     it('should truncate long file lists in details', () => {
       const manyFiles = Array.from({ length: 20 }, (_, i) => `file${i}.go`);
       const verification: GitVerification = {
-        beforeHash: 'abc123',
-        afterHash: 'def456',
+        beforeHash: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+        afterHash: 'd1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2',
         filesChanged: manyFiles,
         linesAdded: 50,
         linesDeleted: 10,
@@ -355,8 +355,8 @@ describe('git-verification module', () => {
 
     it('should match nested package paths', () => {
       const verification: GitVerification = {
-        beforeHash: 'abc123',
-        afterHash: 'def456',
+        beforeHash: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+        afterHash: 'd1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2',
         filesChanged: ['internal/agent/delegation/manager.go'],
         linesAdded: 50,
         linesDeleted: 10,
@@ -372,8 +372,8 @@ describe('git-verification module', () => {
   describe('formatGitVerification', () => {
     it('should format verification for display', () => {
       const verification: GitVerification = {
-        beforeHash: 'abc123def456789012345678',
-        afterHash: 'def456abc123789012345678',
+        beforeHash: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+        afterHash: 'd1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2',
         filesChanged: ['file1.go', 'file2.go'],
         linesAdded: 50,
         linesDeleted: 10,
@@ -383,8 +383,8 @@ describe('git-verification module', () => {
       const formatted = formatGitVerification(verification);
 
       expect(formatted).toContain('Git Verification');
-      expect(formatted).toContain('abc123de'); // Truncated beforeHash
-      expect(formatted).toContain('def456ab'); // Truncated afterHash
+      expect(formatted).toContain('a1b2c3d4'); // Truncated beforeHash
+      expect(formatted).toContain('d1e2f3a4'); // Truncated afterHash
       expect(formatted).toContain('2 changed');
       expect(formatted).toContain('+50');
       expect(formatted).toContain('-10');
@@ -395,8 +395,8 @@ describe('git-verification module', () => {
 
     it('should truncate file list after 5 files', () => {
       const verification: GitVerification = {
-        beforeHash: 'abc123',
-        afterHash: 'def456',
+        beforeHash: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+        afterHash: 'd1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2',
         filesChanged: [
           'file1.go',
           'file2.go',
@@ -421,8 +421,8 @@ describe('git-verification module', () => {
 
     it('should handle empty file list', () => {
       const verification: GitVerification = {
-        beforeHash: 'abc123',
-        afterHash: 'def456',
+        beforeHash: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+        afterHash: 'd1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2',
         filesChanged: [],
         linesAdded: 0,
         linesDeleted: 0,
@@ -437,8 +437,8 @@ describe('git-verification module', () => {
 
     it('should format zero line changes correctly', () => {
       const verification: GitVerification = {
-        beforeHash: 'abc123',
-        afterHash: 'def456',
+        beforeHash: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+        afterHash: 'd1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2',
         filesChanged: ['README.md'],
         linesAdded: 0,
         linesDeleted: 0,

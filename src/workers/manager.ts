@@ -41,6 +41,41 @@ export { createEnforcementIntegration } from "./enforcement-integration.js";
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
+// Default tools allowed for workers - can be overridden via CLAUDE_SWARM_ALLOWED_TOOLS
+const DEFAULT_WORKER_TOOLS = "Bash,Read,Write,Edit,Glob,Grep";
+
+/**
+ * Get worker CLI flags from environment variables
+ * Allows customization of worker behavior without code changes
+ */
+function getWorkerFlags(allowedTools?: string): string {
+  const tools = allowedTools || process.env.CLAUDE_SWARM_ALLOWED_TOOLS || DEFAULT_WORKER_TOOLS;
+  const permissionMode = process.env.CLAUDE_SWARM_PERMISSION_MODE || "bypassPermissions";
+  const mcpServersJson = process.env.CLAUDE_SWARM_MCP_SERVERS || "{}";
+
+  // Parse MCP servers (validate JSON)
+  let mcpServers = {};
+  try {
+    mcpServers = JSON.parse(mcpServersJson);
+  } catch {
+    // Invalid JSON, use empty
+  }
+
+  const flags: string[] = [];
+
+  // Explicitly allow specific tools (bypasses permission prompts for these)
+  flags.push(`--allowedTools ${shellQuote(tools)}`);
+
+  // Set permission mode (bypassPermissions for headless workers)
+  flags.push(`--permission-mode ${shellQuote(permissionMode)}`);
+
+  // Use inline MCP config with specified servers (empty by default)
+  const mcpConfig = JSON.stringify({ mcpServers });
+  flags.push(`--mcp-config ${shellQuote(mcpConfig)}`);
+
+  return flags.join(" ");
+}
+
 interface StartWorkerResult {
   success: boolean;
   sessionName?: string;
@@ -530,16 +565,19 @@ echo 'PLANNER_EXITED' >> ${shellQuote(logFile)}
       // Create a wrapper script that reads the prompt from file
       // This avoids any shell escaping issues
       const wrapperScript = path.join(this.workerDir, `${feature.id}.sh`);
+      // Get worker flags from environment (configurable tools, permission mode, MCP servers)
+      const workerFlags = getWorkerFlags();
       const scriptContent = `#!/bin/bash
 set -e
 cd ${shellQuote(this.projectDir)}
 PROMPT=$(cat ${shellQuote(promptFile)})
 # Prefer claude-code for Max plan compatibility (uses session auth, not API credits)
 # Falls back to claude (API mode) if claude-code is unavailable
+# Worker flags configured via env vars: CLAUDE_SWARM_ALLOWED_TOOLS, CLAUDE_SWARM_PERMISSION_MODE, CLAUDE_SWARM_MCP_SERVERS
 if command -v claude-code &> /dev/null; then
-  claude-code -p "$PROMPT" --allowedTools Bash,Read,Write,Edit,Glob,Grep 2>&1 | tee ${shellQuote(logFile)}
+  claude-code ${workerFlags} -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
 else
-  claude -p "$PROMPT" --allowedTools Bash,Read,Write,Edit,Glob,Grep 2>&1 | tee ${shellQuote(logFile)}
+  claude ${workerFlags} -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
 fi
 echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
 `;
@@ -1717,6 +1755,8 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
         this.workerDir,
         `${type}-review.sh`
       );
+      // Reviewers get restricted tools (no Bash for security)
+      const reviewerFlags = getWorkerFlags("Read,Glob,Grep,Write");
       const scriptContent = `#!/bin/bash
 set -e
 cd ${shellQuote(this.projectDir)}
@@ -1725,9 +1765,9 @@ PROMPT=$(cat ${shellQuote(promptFile)})
 # Falls back to claude (API mode) if claude-code is unavailable
 # Note: Bash intentionally excluded for security - reviewers don't need shell access
 if command -v claude-code &> /dev/null; then
-  claude-code -p "$PROMPT" --allowedTools Read,Glob,Grep,Write 2>&1 | tee ${shellQuote(logFile)}
+  claude-code ${reviewerFlags} -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
 else
-  claude -p "$PROMPT" --allowedTools Read,Glob,Grep,Write 2>&1 | tee ${shellQuote(logFile)}
+  claude ${reviewerFlags} -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
 fi
 echo 'REVIEWER_EXITED' >> ${shellQuote(logFile)}
 `;
