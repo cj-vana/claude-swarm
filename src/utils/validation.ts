@@ -26,8 +26,7 @@ export async function validateFeature(
   projectDir: string
 ): Promise<ValidationResult> {
   const checks: ValidationCheck[] = [];
-  let overallPassed = true;
-  let errorMessage: string | undefined;
+  let blockingError: string | undefined;
 
   // Skip validation if not enabled
   if (!feature.validation?.enabled) {
@@ -51,8 +50,7 @@ export async function validateFeature(
     checks.push(coverageCheck);
 
     if (!coverageCheck.passed && config.enforceBlocking) {
-      overallPassed = false;
-      errorMessage = coverageCheck.details || "Coverage below target";
+      blockingError = blockingError || coverageCheck.details || "Coverage below target";
     }
   }
 
@@ -66,38 +64,50 @@ export async function validateFeature(
     checks.push(testCheck);
 
     if (!testCheck.passed && config.enforceBlocking) {
-      overallPassed = false;
-      errorMessage = testCheck.details || "Tests failed";
+      blockingError = blockingError || testCheck.details || "Tests failed";
     }
   }
 
   // Check 3: Git verification - verify changes match expected packages
-  if (
-    feature.gitVerification &&
-    config.expectedPackages &&
-    config.expectedPackages.length > 0
-  ) {
-    const gitCheck = verifyExpectedPackages(
-      feature.gitVerification,
-      config.expectedPackages
-    );
+  if (config.expectedPackages && config.expectedPackages.length > 0) {
+    if (!feature.gitVerification) {
+      // Fail explicitly when git verification data is unavailable
+      const details = "Git verification unavailable; cannot validate expected packages.";
+      checks.push({
+        name: "git-packages",
+        passed: false,
+        details,
+      });
 
-    checks.push({
-      name: "git-packages",
-      passed: gitCheck.matched,
-      details: gitCheck.details,
-    });
+      if (config.enforceBlocking) {
+        blockingError = blockingError || details;
+      }
+    } else {
+      const gitCheck = verifyExpectedPackages(
+        feature.gitVerification,
+        config.expectedPackages
+      );
 
-    if (!gitCheck.matched && config.enforceBlocking) {
-      overallPassed = false;
-      errorMessage = gitCheck.details;
+      checks.push({
+        name: "git-packages",
+        passed: gitCheck.matched,
+        details: gitCheck.details,
+      });
+
+      if (!gitCheck.matched && config.enforceBlocking) {
+        blockingError = blockingError || gitCheck.details;
+      }
     }
   }
 
+  // passed reflects actual check results, independent of enforceBlocking
+  // error is only set when enforceBlocking is true and checks failed
+  const passed = checks.length === 0 || checks.every((c) => c.passed);
+
   return {
-    passed: overallPassed,
+    passed,
     checks,
-    error: errorMessage,
+    error: blockingError,
     timestamp: new Date().toISOString(),
   };
 }
