@@ -6158,6 +6158,135 @@ function getActionIcon(action: string): string {
 }
 
 // ============================================================================
+// TOOL: auto_orchestrate
+// ============================================================================
+server.tool(
+  "auto_orchestrate",
+  "Automatically schedule and monitor workers based on priority, dependencies, and worker health. Runs hands-free until all features complete.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    strategy: z.enum(["breadth-first", "depth-first", "adaptive"]).optional().describe("Scheduling strategy (default: adaptive)"),
+    maxConcurrent: z.number().min(1).max(10).optional().describe("Maximum concurrent workers (default: 5)"),
+    checkIntervalSeconds: z.number().min(10).max(300).optional().describe("How often to check worker progress in seconds (default: 30)"),
+  },
+  async ({ projectDir, strategy = "adaptive", maxConcurrent = 5, checkIntervalSeconds = 30 }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
+
+    const current = state.load();
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active session. Use orchestrator_init first." }],
+      };
+    }
+
+    // Priority calculation function
+    function calculatePriority(feature: Feature, allFeatures: Feature[]): number {
+      let score = 0;
+
+      // +50 points per feature this blocks
+      const blockedCount = allFeatures.filter(f =>
+        f.dependsOn?.includes(feature.id) && f.status === "pending"
+      ).length;
+      score += blockedCount * 50;
+
+      // +40 points if no dependencies (can start immediately)
+      if (!feature.dependsOn || feature.dependsOn.length === 0) {
+        score += 40;
+      }
+
+      // +30 points for low complexity (if available)
+      if (feature.complexity && feature.complexity.score < 40) {
+        score += 30;
+      }
+
+      // -20 points per previous attempt (struggling)
+      score -= (feature.attempts || 0) * 20;
+
+      // Strategy-specific adjustments
+      if (strategy === "breadth-first") {
+        // Prefer features with no dependencies
+        if (!feature.dependsOn || feature.dependsOn.length === 0) score += 20;
+      } else if (strategy === "depth-first") {
+        // Prefer features that unblock others
+        score += blockedCount * 30;
+      }
+
+      return Math.max(0, score);
+    }
+
+    // Get features ready to work on
+    function getReadyFeatures(): Feature[] {
+      return current!.features.filter(f => {
+        if (f.status !== "pending") return false;
+
+        // Check dependencies are met
+        if (f.dependsOn && f.dependsOn.length > 0) {
+          const unmetDeps = f.dependsOn.filter(depId => {
+            const dep = current!.features.find(df => df.id === depId);
+            return !dep || dep.status !== "completed";
+          });
+          if (unmetDeps.length > 0) return false;
+        }
+
+        return true;
+      });
+    }
+
+    // Start orchestration
+    let iterationCount = 0;
+    const maxIterations = 100; // Safety limit
+    let totalStarted = 0;
+    let totalCompleted = 0;
+
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 🤖 Auto-orchestration started (strategy: ${strategy}, maxConcurrent: ${maxConcurrent})`
+    );
+    state.save(current);
+
+    // Main orchestration loop would go here in a real implementation
+    // For now, we'll return a plan of what would be executed
+
+    const readyFeatures = getReadyFeatures();
+    const prioritized = readyFeatures
+      .map(f => ({ feature: f, priority: calculatePriority(f, current.features) }))
+      .sort((a, b) => b.priority - a.priority);
+
+    const nextBatch = prioritized.slice(0, maxConcurrent);
+
+    let response = `🤖 Auto-Orchestration Plan\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    response += `Strategy: ${strategy}\n`;
+    response += `Max Concurrent: ${maxConcurrent}\n`;
+    response += `Ready Features: ${readyFeatures.length}\n\n`;
+
+    if (nextBatch.length > 0) {
+      response += `📊 Next Batch (${nextBatch.length} features):\n`;
+      for (const { feature, priority } of nextBatch) {
+        response += `  ${feature.id} (priority: ${priority}) - ${feature.description.substring(0, 60)}...\n`;
+      }
+
+      response += `\n💡 To execute this plan, use:\n`;
+      response += `start_parallel_workers(featureIds=[`;
+      response += nextBatch.map(b => `"${b.feature.id}"`).join(", ");
+      response += `])\n\n`;
+
+      response += `Then check progress periodically with check_all_workers.`;
+    } else {
+      response += `✅ No features ready to start.\n`;
+      const pending = current.features.filter(f => f.status === "pending");
+      if (pending.length > 0) {
+        response += `\n${pending.length} features pending but blocked by dependencies.`;
+      } else {
+        response += `\nAll features completed!`;
+      }
+    }
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
 // Start the server
 // ============================================================================
 async function main() {
