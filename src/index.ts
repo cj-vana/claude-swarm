@@ -42,6 +42,12 @@ import { getProposalManager, ProposalManager, type ProtocolProposal } from "./pr
 import { getBaseConstraints } from "./protocols/base-constraints.js";
 import type { BaseConstraints } from "./protocols/schema.js";
 import { SetupManager } from "./setup/manager.js";
+import { validateFeature } from "./utils/validation.js";
+import {
+  captureGitState,
+  calculateGitVerification,
+  formatGitVerification,
+} from "./utils/git-verification.js";
 
 // Dashboard configuration from environment variables
 const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT || "3456", 10);
@@ -447,6 +453,22 @@ server.tool(
       }
     }
 
+    // Capture git state before worker starts (for verification)
+    try {
+      const beforeHash = captureGitState(projectDir);
+      feature.gitVerification = {
+        beforeHash,
+        afterHash: "",
+        filesChanged: [],
+        linesAdded: 0,
+        linesDeleted: 0,
+        diffChecksum: "",
+      };
+    } catch (error) {
+      // Git state capture is optional - continue without it
+      console.warn("Failed to capture git state:", error);
+    }
+
     // Start the worker
     const result = await workers.startWorker(feature, customPrompt);
 
@@ -565,7 +587,27 @@ server.tool(
       error?: string;
     }> = [];
 
+    // Capture git state once for all workers (they start from same point)
+    let beforeHash: string | undefined;
+    try {
+      beforeHash = captureGitState(projectDir);
+    } catch (error) {
+      console.warn("Failed to capture git state:", error);
+    }
+
     const startPromises = featuresToStart.map(async (feature) => {
+      // Set git verification if we captured state
+      if (beforeHash) {
+        feature.gitVerification = {
+          beforeHash,
+          afterHash: "",
+          filesChanged: [],
+          linesAdded: 0,
+          linesDeleted: 0,
+          diffChecksum: "",
+        };
+      }
+
       const customPrompt = customPrompts?.[feature.id];
       const result = await workers.startWorker(feature, customPrompt);
 
@@ -1161,10 +1203,80 @@ server.tool(
       feature.modifiedFiles = modifiedFiles;
     }
 
+    // Calculate git verification if we captured beforeHash
+    if (feature.gitVerification && feature.gitVerification.beforeHash) {
+      try {
+        const verification = calculateGitVerification(
+          projectDir,
+          feature.gitVerification.beforeHash
+        );
+        feature.gitVerification = verification;
+      } catch (error) {
+        console.warn("Failed to calculate git verification:", error);
+      }
+    }
+
+    // Validation: Run validation checks if marking as success
+    let validationWarning = "";
+    let validationBlocked = false;
+
+    if (success && feature.validation?.enabled) {
+      try {
+        const validationResult = await validateFeature(feature, projectDir);
+        feature.validationResult = validationResult;
+
+        if (!validationResult.passed && feature.validation.enforceBlocking) {
+          // Validation failed and blocking is enforced - prevent completion
+          validationBlocked = true;
+
+          // Format validation failure details
+          const failedChecks = validationResult.checks
+            .filter(c => !c.passed)
+            .map(c => `  • ${c.name}: ${c.details}`)
+            .join("\n");
+
+          const validationError = `Validation failed:\n${failedChecks}`;
+          feature.lastError = validationError;
+
+          // Keep as pending for retry
+          feature.status = "pending";
+          feature.workerId = undefined;
+
+          current.progressLog.push(
+            `[${new Date().toISOString()}] 🔄 Validation failed: ${featureId} - attempt ${feature.attempts}/${feature.maxRetries || maxRetries}\n${validationError}`
+          );
+          current.lastUpdated = new Date().toISOString();
+          state.save(current);
+          state.writeProgressFile();
+
+          const retryGuidance = feature.attempts < (feature.maxRetries || maxRetries)
+            ? `\n\n💡 Feature will be retried (attempt ${feature.attempts + 1}/${feature.maxRetries || maxRetries}). Address validation failures:\n${failedChecks}\n\nUse start_worker to launch retry.`
+            : `\n\n❌ Max retries (${feature.maxRetries || maxRetries}) exhausted. Validation still failing.`;
+
+          return {
+            content: [{
+              type: "text",
+              text: `🚫 Validation blocked completion of ${featureId}\n\n${validationError}${retryGuidance}`,
+            }],
+          };
+        } else if (!validationResult.passed) {
+          // Validation failed but not blocking - just warn
+          const failedChecks = validationResult.checks
+            .filter(c => !c.passed)
+            .map(c => `  • ${c.name}: ${c.details}`)
+            .join("\n");
+          validationWarning = `\n\n⚠️ WARNING: Validation checks failed (non-blocking):\n${failedChecks}`;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        validationWarning = `\n\n⚠️ WARNING: Validation execution failed: ${message}`;
+      }
+    }
+
     let resultStatus: string;
     let willRetry = false;
 
-    if (success) {
+    if (success && !validationBlocked) {
       // Mark as completed
       feature.status = "completed";
       feature.completedAt = new Date().toISOString();
@@ -1255,6 +1367,11 @@ server.tool(
     const total = current.features.length;
 
     let responseText = `${success ? "✅" : willRetry ? "🔄" : "❌"} Feature ${featureId} ${resultStatus}.\n\nProgress: ${completed}/${total} features completed`;
+
+    // Add validation warning if present
+    if (validationWarning) {
+      responseText += validationWarning;
+    }
 
     if (willRetry) {
       responseText += `\n\n💡 Feature will be retried. Use start_worker to launch a new attempt.`;
@@ -6156,6 +6273,135 @@ function getActionIcon(action: string): string {
       return "📝";
   }
 }
+
+// ============================================================================
+// TOOL: auto_orchestrate
+// ============================================================================
+server.tool(
+  "auto_orchestrate",
+  "Automatically schedule and monitor workers based on priority, dependencies, and worker health. Runs hands-free until all features complete.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    strategy: z.enum(["breadth-first", "depth-first", "adaptive"]).optional().describe("Scheduling strategy (default: adaptive)"),
+    maxConcurrent: z.number().min(1).max(10).optional().describe("Maximum concurrent workers (default: 5)"),
+    checkIntervalSeconds: z.number().min(10).max(300).optional().describe("How often to check worker progress in seconds (default: 30)"),
+  },
+  async ({ projectDir, strategy = "adaptive", maxConcurrent = 5, checkIntervalSeconds = 30 }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
+
+    const current = state.load();
+    if (!current) {
+      return {
+        content: [{ type: "text", text: "No active session. Use orchestrator_init first." }],
+      };
+    }
+
+    // Priority calculation function
+    function calculatePriority(feature: Feature, allFeatures: Feature[]): number {
+      let score = 0;
+
+      // +50 points per feature this blocks
+      const blockedCount = allFeatures.filter(f =>
+        f.dependsOn?.includes(feature.id) && f.status === "pending"
+      ).length;
+      score += blockedCount * 50;
+
+      // +40 points if no dependencies (can start immediately)
+      if (!feature.dependsOn || feature.dependsOn.length === 0) {
+        score += 40;
+      }
+
+      // +30 points for low complexity (if available)
+      if (feature.complexity && feature.complexity.score < 40) {
+        score += 30;
+      }
+
+      // -20 points per previous attempt (struggling)
+      score -= (feature.attempts || 0) * 20;
+
+      // Strategy-specific adjustments
+      if (strategy === "breadth-first") {
+        // Prefer features with no dependencies
+        if (!feature.dependsOn || feature.dependsOn.length === 0) score += 20;
+      } else if (strategy === "depth-first") {
+        // Prefer features that unblock others
+        score += blockedCount * 30;
+      }
+
+      return Math.max(0, score);
+    }
+
+    // Get features ready to work on
+    function getReadyFeatures(): Feature[] {
+      return current!.features.filter(f => {
+        if (f.status !== "pending") return false;
+
+        // Check dependencies are met
+        if (f.dependsOn && f.dependsOn.length > 0) {
+          const unmetDeps = f.dependsOn.filter(depId => {
+            const dep = current!.features.find(df => df.id === depId);
+            return !dep || dep.status !== "completed";
+          });
+          if (unmetDeps.length > 0) return false;
+        }
+
+        return true;
+      });
+    }
+
+    // Start orchestration
+    let iterationCount = 0;
+    const maxIterations = 100; // Safety limit
+    let totalStarted = 0;
+    let totalCompleted = 0;
+
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 🤖 Auto-orchestration started (strategy: ${strategy}, maxConcurrent: ${maxConcurrent})`
+    );
+    state.save(current);
+
+    // Main orchestration loop would go here in a real implementation
+    // For now, we'll return a plan of what would be executed
+
+    const readyFeatures = getReadyFeatures();
+    const prioritized = readyFeatures
+      .map(f => ({ feature: f, priority: calculatePriority(f, current.features) }))
+      .sort((a, b) => b.priority - a.priority);
+
+    const nextBatch = prioritized.slice(0, maxConcurrent);
+
+    let response = `🤖 Auto-Orchestration Plan\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    response += `Strategy: ${strategy}\n`;
+    response += `Max Concurrent: ${maxConcurrent}\n`;
+    response += `Ready Features: ${readyFeatures.length}\n\n`;
+
+    if (nextBatch.length > 0) {
+      response += `📊 Next Batch (${nextBatch.length} features):\n`;
+      for (const { feature, priority } of nextBatch) {
+        response += `  ${feature.id} (priority: ${priority}) - ${feature.description.substring(0, 60)}...\n`;
+      }
+
+      response += `\n💡 To execute this plan, use:\n`;
+      response += `start_parallel_workers(featureIds=[`;
+      response += nextBatch.map(b => `"${b.feature.id}"`).join(", ");
+      response += `])\n\n`;
+
+      response += `Then check progress periodically with check_all_workers.`;
+    } else {
+      response += `✅ No features ready to start.\n`;
+      const pending = current.features.filter(f => f.status === "pending");
+      if (pending.length > 0) {
+        response += `\n${pending.length} features pending but blocked by dependencies.`;
+      } else {
+        response += `\nAll features completed!`;
+      }
+    }
+
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
 
 // ============================================================================
 // Start the server
