@@ -206,6 +206,81 @@ export function sanitizeOutput(output: string, maxLength: number = 5000): string
 }
 
 /**
+ * Escape special regex characters in a string
+ * Prevents regex injection (ReDoS) attacks
+ */
+export function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Detect potentially dangerous regex patterns that could cause catastrophic backtracking (ReDoS)
+ * Returns true if the pattern appears dangerous
+ */
+export function isDangerousRegexPattern(pattern: string): boolean {
+  // Detect nested quantifiers like (a+)+ or (a*)*
+  if (/\([^)]*[+*][^)]*\)[+*]/.test(pattern)) {
+    return true;
+  }
+  // Detect repeated quantifiers like a++ or a**
+  if (/[+*]{2,}/.test(pattern)) {
+    return true;
+  }
+  // Detect overlapping alternation with quantifiers like (a|a)+
+  if (/\([^)]*\|[^)]*\)[+*]/.test(pattern)) {
+    return true;
+  }
+  // Detect non-capturing groups with nested quantifiers like (?:a+)+
+  if (/\(\?:[^)]*[+*][^)]*\)[+*]/.test(pattern)) {
+    return true;
+  }
+  // Detect range quantifiers in nested groups like (a{2,})+ or (a+){2,}
+  if (/\([^)]*[+*][^)]*\)\{/.test(pattern)) {
+    return true;
+  }
+  // Detect nested range quantifiers like (a{1,10}){2,} or groups with ranges followed by quantifiers
+  if (/\([^)]*\{[^}]+\}[^)]*\)[+*{]/.test(pattern)) {
+    return true;
+  }
+  // Detect consecutive range quantifiers like a{1,100}{1,100}
+  if (/\{[^}]+\}\{/.test(pattern)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Safely test a regex pattern against a value
+ * Falls back to literal matching if pattern is dangerous or invalid
+ * Includes null/undefined guards for defensive programming
+ */
+export function safeRegexTest(pattern: string, value: string): boolean {
+  // Defensive null/undefined guards - fail closed (no match)
+  if (pattern == null || value == null) {
+    return false;
+  }
+
+  // Empty pattern should not match anything (security-safe default)
+  if (pattern === "") {
+    return false;
+  }
+
+  // Check for dangerous patterns first
+  if (isDangerousRegexPattern(pattern)) {
+    // Fall back to literal matching (case-insensitive)
+    return value.toLowerCase().includes(pattern.toLowerCase());
+  }
+
+  try {
+    const regex = new RegExp(pattern, "i");
+    return regex.test(value);
+  } catch {
+    // Invalid regex - fall back to literal matching
+    return value.toLowerCase().includes(pattern.toLowerCase());
+  }
+}
+
+/**
  * Zod schema for complexity signals
  */
 export const ComplexitySignalsSchema = z.object({

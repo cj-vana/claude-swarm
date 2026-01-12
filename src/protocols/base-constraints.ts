@@ -706,21 +706,34 @@ function checkConstraintWarnings(
 
 /**
  * Check if a tool is prohibited
+ * Uses exact match for single-word tools, token-based matching for command patterns
+ * This prevents false positives (e.g., "npm" being blocked when "rm" is prohibited)
  */
 function isToolProhibited(tool: string, prohibitedTools: string[]): boolean {
   const normalizedTool = tool.toLowerCase().trim();
   return prohibitedTools.some((prohibited) => {
     const normalizedProhibited = prohibited.toLowerCase().trim();
-    // Exact match or substring match
-    return (
-      normalizedTool === normalizedProhibited ||
-      normalizedTool.includes(normalizedProhibited)
-    );
+
+    // Exact match only for single-word tools
+    if (!normalizedProhibited.includes(" ")) {
+      return normalizedTool === normalizedProhibited;
+    }
+
+    // For command patterns (e.g., "rm -rf"), check if tool starts with command
+    // and the prohibited pattern appears as a complete token sequence
+    const prohibitedTokens = normalizedProhibited.split(/\s+/);
+    const toolTokens = normalizedTool.split(/\s+/);
+
+    if (toolTokens.length < prohibitedTokens.length) return false;
+
+    // Check if all prohibited tokens match at the start of tool tokens
+    return prohibitedTokens.every((token, i) => toolTokens[i] === token);
   });
 }
 
 /**
  * Check if a path is prohibited
+ * Protected against ReDoS by escaping all regex metacharacters before glob conversion
  */
 function isPathProhibited(path: string, prohibitedPaths: string[]): boolean {
   const normalizedPath = path.toLowerCase().trim();
@@ -728,26 +741,35 @@ function isPathProhibited(path: string, prohibitedPaths: string[]): boolean {
     const normalizedProhibited = prohibited.toLowerCase().trim();
 
     // Handle glob patterns
-    if (normalizedProhibited.includes("*")) {
-      // Convert glob to regex
+    if (normalizedProhibited.includes("*") || normalizedProhibited.includes("?")) {
+      // Convert glob to regex with proper escaping
+      // First escape ALL regex metacharacters except * and ?
       const regexPattern = normalizedProhibited
-        .replace(/\*\*/g, "<<GLOBSTAR>>")
-        .replace(/\*/g, "[^/]*")
-        .replace(/<<GLOBSTAR>>/g, ".*");
+        .replace(/[.+^${}()|[\]\\]/g, "\\$&") // Escape regex metacharacters first
+        .replace(/\*\*/g, "<<<GLOBSTAR>>>")    // Preserve globstar
+        .replace(/\*/g, "[^/]*")               // Single star = anything except /
+        .replace(/<<<GLOBSTAR>>>/g, ".*")      // Globstar = anything including /
+        .replace(/\?/g, "[^/]");               // Question mark = single char except /
+
       try {
         const regex = new RegExp(`^${regexPattern}$`);
         return regex.test(normalizedPath);
       } catch {
         // Invalid regex, fall back to substring
-        return normalizedPath.includes(normalizedProhibited.replace(/\*/g, ""));
+        return normalizedPath.includes(normalizedProhibited.replace(/[*?]/g, ""));
       }
     }
 
-    // Exact match or prefix match
-    return (
-      normalizedPath === normalizedProhibited ||
-      normalizedPath.startsWith(normalizedProhibited)
-    );
+    // Exact match or prefix match (with path separator boundary check)
+    if (normalizedPath === normalizedProhibited) {
+      return true;
+    }
+    // Prefix match: ensure it's a directory boundary (ends with / or the path has / after)
+    if (normalizedPath.startsWith(normalizedProhibited)) {
+      const charAfter = normalizedPath[normalizedProhibited.length];
+      return charAfter === "/" || charAfter === undefined;
+    }
+    return false;
   });
 }
 

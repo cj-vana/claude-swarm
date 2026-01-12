@@ -32,6 +32,7 @@ import type {
 import { ProtocolValidationResultSchema } from "./schema.js";
 import type { ProtocolRegistry, ProtocolViolation } from "./registry.js";
 import type { ProtocolResolver, EffectiveConstraints } from "./resolver.js";
+import { isDangerousRegexPattern, safeRegexTest } from "../utils/security.js";
 
 // ============================================================================
 // Execution Context Types
@@ -230,6 +231,7 @@ function generateAlertId(): string {
 /**
  * Check if a path matches a glob-like pattern
  * Supports * (single segment) and ** (multiple segments)
+ * Protected against ReDoS attacks using isDangerousRegexPattern
  */
 function pathMatchesPattern(path: string, pattern: string): boolean {
   // Normalize paths
@@ -244,8 +246,16 @@ function pathMatchesPattern(path: string, pattern: string): boolean {
     .replace(/\?/g, "[^/]") // Single character
     .replace(/\./g, "\\."); // Escape dots
 
+  const fullPattern = `^${regexPattern}$`;
+
+  // Check for dangerous patterns before creating RegExp (ReDoS protection)
+  if (isDangerousRegexPattern(fullPattern)) {
+    // Fall back to literal matching
+    return normalizedPath.toLowerCase().includes(normalizedPattern.toLowerCase());
+  }
+
   try {
-    const regex = new RegExp(`^${regexPattern}$`);
+    const regex = new RegExp(fullPattern);
     return regex.test(normalizedPath);
   } catch {
     // If pattern is invalid, do exact match
@@ -255,16 +265,10 @@ function pathMatchesPattern(path: string, pattern: string): boolean {
 
 /**
  * Check if a string matches any pattern in a list
+ * Protected against ReDoS attacks using safeRegexTest from security.ts
  */
 function matchesAnyPattern(value: string, patterns: string[]): boolean {
-  return patterns.some(pattern => {
-    try {
-      const regex = new RegExp(pattern);
-      return regex.test(value);
-    } catch {
-      return value.includes(pattern);
-    }
-  });
+  return patterns.some(pattern => safeRegexTest(pattern, value));
 }
 
 // ============================================================================
@@ -458,20 +462,15 @@ export class EnforcementEngine {
       };
     }
 
-    // Check tool patterns for denial
+    // Check tool patterns for denial (protected against ReDoS)
     if (rule.toolPatterns) {
       for (const pattern of rule.toolPatterns) {
-        try {
-          const regex = new RegExp(pattern);
-          if (regex.test(toolName)) {
-            return {
-              passed: false,
-              message: `Tool '${toolName}' matches denied pattern '${pattern}'`,
-              context: { tool: toolName, pattern },
-            };
-          }
-        } catch {
-          // Invalid regex - skip
+        if (safeRegexTest(pattern, toolName)) {
+          return {
+            passed: false,
+            message: `Tool '${toolName}' matches denied pattern '${pattern}'`,
+            context: { tool: toolName, pattern },
+          };
         }
       }
     }
@@ -609,54 +608,30 @@ export class EnforcementEngine {
       };
     }
 
-    // Check forbidden patterns
+    // Check forbidden patterns (protected against ReDoS)
     if (rule.forbiddenPatterns) {
       for (const pattern of rule.forbiddenPatterns) {
-        try {
-          const regex = new RegExp(pattern);
-          if (regex.test(output)) {
-            return {
-              passed: false,
-              message: `Output contains forbidden pattern '${pattern}'`,
-              context: { pattern },
-              remediation: `Remove content matching the forbidden pattern`,
-            };
-          }
-        } catch {
-          // Invalid regex - check as substring
-          if (output.includes(pattern)) {
-            return {
-              passed: false,
-              message: `Output contains forbidden content '${pattern}'`,
-              context: { pattern },
-            };
-          }
+        if (safeRegexTest(pattern, output)) {
+          return {
+            passed: false,
+            message: `Output contains forbidden pattern '${pattern}'`,
+            context: { pattern },
+            remediation: `Remove content matching the forbidden pattern`,
+          };
         }
       }
     }
 
-    // Check required patterns
+    // Check required patterns (protected against ReDoS)
     if (rule.requiredPatterns) {
       for (const pattern of rule.requiredPatterns) {
-        try {
-          const regex = new RegExp(pattern);
-          if (!regex.test(output)) {
-            return {
-              passed: false,
-              message: `Output missing required pattern '${pattern}'`,
-              context: { pattern },
-              remediation: `Include content matching the required pattern`,
-            };
-          }
-        } catch {
-          // Invalid regex - check as substring
-          if (!output.includes(pattern)) {
-            return {
-              passed: false,
-              message: `Output missing required content '${pattern}'`,
-              context: { pattern },
-            };
-          }
+        if (!safeRegexTest(pattern, output)) {
+          return {
+            passed: false,
+            message: `Output missing required pattern '${pattern}'`,
+            context: { pattern },
+            remediation: `Include content matching the required pattern`,
+          };
         }
       }
     }
@@ -781,6 +756,10 @@ export class EnforcementEngine {
         const oneHourAgo = Date.now() - 3600000;
         const recentMinute = timestamps.filter(t => t > oneMinuteAgo);
         const recentHour = timestamps.filter(t => t > oneHourAgo);
+
+        // IMPORTANT: Truncate stored timestamps to prevent memory leak
+        // Only keep timestamps from the last hour (the longest window we need)
+        state.operationCounts.set(operationType, recentHour);
 
         if (rule.rateLimitPerMinute && recentMinute.length >= rule.rateLimitPerMinute) {
           return {
@@ -1059,6 +1038,12 @@ export class EnforcementEngine {
     }
   }
 
+  // Maximum number of observed patterns to track per worker
+  private static readonly MAX_OBSERVED_PATTERNS = 100;
+
+  // Maximum number of active alerts per worker to prevent unbounded memory growth
+  private static readonly MAX_ACTIVE_ALERTS = 50;
+
   /**
    * Record an observed pattern
    */
@@ -1077,6 +1062,15 @@ export class EnforcementEngine {
         }
       }
     } else {
+      // Cap the observedPatterns array to prevent unbounded memory growth
+      if (state.observedPatterns.length >= EnforcementEngine.MAX_OBSERVED_PATTERNS) {
+        // Remove the least recently seen pattern
+        state.observedPatterns.sort((a, b) =>
+          new Date(a.lastSeen).getTime() - new Date(b.lastSeen).getTime()
+        );
+        state.observedPatterns.shift();
+      }
+
       state.observedPatterns.push({
         type,
         frequency: 1,
@@ -1115,6 +1109,17 @@ export class EnforcementEngine {
           acknowledged: false,
         };
         newAlerts.push(alert);
+
+        // Cap activeAlerts to prevent unbounded memory growth
+        if (state.activeAlerts.length >= EnforcementEngine.MAX_ACTIVE_ALERTS) {
+          // Remove oldest unacknowledged alert, or oldest overall if all acknowledged
+          const unacknowledgedIndex = state.activeAlerts.findIndex(a => !a.acknowledged);
+          if (unacknowledgedIndex >= 0) {
+            state.activeAlerts.splice(unacknowledgedIndex, 1);
+          } else {
+            state.activeAlerts.shift();
+          }
+        }
         state.activeAlerts.push(alert);
       }
     }

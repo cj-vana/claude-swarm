@@ -19,6 +19,7 @@
 
 import * as path from "path";
 import { z } from "zod";
+import { safeRegexTest, isDangerousRegexPattern } from "../utils/security.js";
 import type {
   ProtocolConstraint,
   ConstraintRule,
@@ -167,9 +168,10 @@ export const ConstraintEvaluationResultSchema = z.object({
 // ============================================================================
 
 /**
- * Convert a glob pattern to a regex for matching
+ * Convert a glob pattern to a regex string for matching
+ * Returns the regex pattern string (not a RegExp object) for safe testing
  */
-function globToRegex(glob: string): RegExp {
+function globToRegexString(glob: string): string {
   // Escape special regex characters except * and ?
   let regexStr = glob
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
@@ -178,24 +180,48 @@ function globToRegex(glob: string): RegExp {
     .replace(/\?/g, ".")
     .replace(/{{DOUBLESTAR}}/g, ".*");
 
-  return new RegExp(`^${regexStr}$`);
+  return `^${regexStr}$`;
+}
+
+/**
+ * Safely test a glob pattern against a value
+ * Uses ReDoS protection via isDangerousRegexPattern
+ */
+function safeGlobTest(glob: string, value: string): boolean {
+  const regexStr = globToRegexString(glob);
+
+  // Check for dangerous patterns before creating RegExp
+  if (isDangerousRegexPattern(regexStr)) {
+    // Fall back to literal matching
+    return value.toLowerCase().includes(glob.toLowerCase());
+  }
+
+  try {
+    const regex = new RegExp(regexStr);
+    return regex.test(value);
+  } catch {
+    // Invalid regex, fall back to literal matching
+    return value.toLowerCase().includes(glob.toLowerCase());
+  }
 }
 
 /**
  * Check if a string matches any pattern in a list
+ * Uses safeRegexTest for ReDoS protection
  */
 function matchesAnyPattern(value: string, patterns: string[]): boolean {
   for (const pattern of patterns) {
     try {
-      // First try as a regex
+      // First try as a regex (patterns wrapped in /.../)
       if (pattern.startsWith("/") && pattern.endsWith("/")) {
         const regexPattern = pattern.slice(1, -1);
-        if (new RegExp(regexPattern).test(value)) {
+        // Use safeRegexTest for ReDoS protection
+        if (safeRegexTest(regexPattern, value)) {
           return true;
         }
       } else {
-        // Treat as glob pattern
-        if (globToRegex(pattern).test(value)) {
+        // Treat as glob pattern with safe testing
+        if (safeGlobTest(pattern, value)) {
           return true;
         }
       }
@@ -255,19 +281,16 @@ export function evaluateToolRestriction(
   // Check tool patterns for denial
   if (rule.toolPatterns && rule.toolPatterns.length > 0) {
     for (const pattern of rule.toolPatterns) {
-      try {
-        // Patterns prefixed with ! are deny patterns
-        if (pattern.startsWith("!")) {
-          const denyPattern = new RegExp(pattern.slice(1));
-          if (denyPattern.test(toolName)) {
-            return {
-              passed: false,
-              reason: `Tool '${toolName}' matches deny pattern '${pattern}'`,
-            };
-          }
+      // Patterns prefixed with ! are deny patterns
+      if (pattern.startsWith("!")) {
+        const denyPatternStr = pattern.slice(1);
+        // Use safeRegexTest for ReDoS protection
+        if (safeRegexTest(denyPatternStr, toolName)) {
+          return {
+            passed: false,
+            reason: `Tool '${toolName}' matches deny pattern '${pattern}'`,
+          };
         }
-      } catch {
-        // Invalid regex, skip
       }
     }
   }
@@ -280,13 +303,10 @@ export function evaluateToolRestriction(
       if (rule.toolPatterns) {
         for (const pattern of rule.toolPatterns) {
           if (!pattern.startsWith("!")) {
-            try {
-              if (new RegExp(pattern).test(toolName)) {
-                allowedByPattern = true;
-                break;
-              }
-            } catch {
-              // Invalid regex, skip
+            // Use safeRegexTest for ReDoS protection
+            if (safeRegexTest(pattern, toolName)) {
+              allowedByPattern = true;
+              break;
             }
           }
         }
@@ -455,15 +475,12 @@ export function evaluateOutputFormat(
   // Check forbidden patterns
   if (rule.forbiddenPatterns && rule.forbiddenPatterns.length > 0) {
     for (const pattern of rule.forbiddenPatterns) {
-      try {
-        if (new RegExp(pattern).test(content)) {
-          return {
-            passed: false,
-            reason: `Output matches forbidden pattern: ${pattern}`,
-          };
-        }
-      } catch {
-        // Invalid regex, skip
+      // Use safeRegexTest for ReDoS protection
+      if (safeRegexTest(pattern, content)) {
+        return {
+          passed: false,
+          reason: `Output matches forbidden pattern: ${pattern}`,
+        };
       }
     }
   }
@@ -471,15 +488,12 @@ export function evaluateOutputFormat(
   // Check required patterns
   if (rule.requiredPatterns && rule.requiredPatterns.length > 0) {
     for (const pattern of rule.requiredPatterns) {
-      try {
-        if (!new RegExp(pattern).test(content)) {
-          return {
-            passed: false,
-            reason: `Output does not match required pattern: ${pattern}`,
-          };
-        }
-      } catch {
-        // Invalid regex, skip
+      // Use safeRegexTest for ReDoS protection
+      if (!safeRegexTest(pattern, content)) {
+        return {
+          passed: false,
+          reason: `Output does not match required pattern: ${pattern}`,
+        };
       }
     }
   }

@@ -74,17 +74,19 @@ const CONCERNING_PATTERNS = {
     /Read.*Read.*Read.*Read/i, // Multiple reads without action
     /Glob.*Glob.*Glob/i, // Multiple searches without progress
   ],
+  // Error patterns - pre-compiled with 'gi' flags for global counting
   errors: [
-    /\berror[:\s]/i,
-    /\bfailed\b/i,
-    /\bexception\b/i,
-    /\bcannot\b/i,
-    /\bunable to\b/i,
-    /exit code: [1-9]/i,
-    /ENOENT/i,
-    /undefined.*not.*defined/i,
+    /\berror[:\s]/gi,
+    /\bfailed\b/gi,
+    /\bexception\b/gi,
+    /\bcannot\b/gi,
+    /\bunable to\b/gi,
+    /exit code: [1-9]/gi,
+    /ENOENT/gi,
+    /undefined.*not.*defined/gi,
   ],
-  retries: [/trying again/i, /retrying/i, /attempt \d+/i, /let me try/i],
+  // Retry patterns - pre-compiled with 'gi' flags for global counting
+  retries: [/trying again/gi, /retrying/gi, /attempt \d+/gi, /let me try/gi],
   frustration: [
     /I('m| am) stuck/i,
     /not working/i,
@@ -206,17 +208,21 @@ export function analyzeOutput(logContent: string): OutputAnalysisScore {
   let frustrationIndicators = 0;
   let completionIndicators = 0;
 
-  // Count errors
+  // Count errors using pre-compiled global patterns
   for (const pattern of CONCERNING_PATTERNS.errors) {
-    const matches = recentContent.match(new RegExp(pattern, "gi"));
+    // Reset lastIndex for global regex before matching
+    pattern.lastIndex = 0;
+    const matches = recentContent.match(pattern);
     if (matches) {
       errorCount += matches.length;
     }
   }
 
-  // Count retries
+  // Count retries using pre-compiled global patterns
   for (const pattern of CONCERNING_PATTERNS.retries) {
-    const matches = recentContent.match(new RegExp(pattern, "gi"));
+    // Reset lastIndex for global regex before matching
+    pattern.lastIndex = 0;
+    const matches = recentContent.match(pattern);
     if (matches) {
       retryCount += matches.length;
     }

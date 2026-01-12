@@ -40,6 +40,7 @@ import {
   type BaseConstraintViolation,
   type BaseConstraintWarning,
 } from "./base-constraints.js";
+import { safeRegexTest } from "../utils/security.js";
 
 // ============================================================================
 // Risk Score Types
@@ -1424,20 +1425,20 @@ export class ProposalValidator {
 
   /**
    * Check if a path matches prohibited paths
+   * Protected against ReDoS using safeRegexTest from security.ts
    */
   private matchesProhibitedPath(path: string): boolean {
     const normalizedPath = path.toLowerCase();
     return this.baseConstraints.prohibitedPaths.some(prohibited => {
       const normalizedProhibited = prohibited.toLowerCase();
       if (normalizedProhibited.includes("*")) {
+        // Escape regex metacharacters first, then convert glob patterns
         const regexPattern = normalizedProhibited
-          .replace(/\*\*/g, ".*")
-          .replace(/\*/g, "[^/]*");
-        try {
-          return new RegExp(`^${regexPattern}$`).test(normalizedPath);
-        } catch {
-          return normalizedPath.includes(normalizedProhibited.replace(/\*/g, ""));
-        }
+          .replace(/[.+^${}()|[\]\\]/g, "\\$&")  // Escape regex metacharacters
+          .replace(/\*\*/g, ".*")                 // ** = any characters
+          .replace(/\*/g, "[^/]*");               // * = any except /
+        // Use safeRegexTest for ReDoS protection
+        return safeRegexTest(`^${regexPattern}$`, normalizedPath);
       }
       return normalizedPath === normalizedProhibited ||
         normalizedPath.startsWith(normalizedProhibited);

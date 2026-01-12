@@ -127,6 +127,10 @@ export class WorkerManager {
   private lastKnownStatus: Map<string, string> = new Map();
   // Optional enforcement integration for protocol governance
   private enforcement: EnforcementIntegration | null = null;
+  // Monitor race condition prevention
+  private monitorRunning = false;
+  private monitorErrorCount = 0;
+  private static readonly MAX_MONITOR_ERRORS = 5;
 
   constructor(projectDir: string, stateManager: StateManager) {
     this.projectDir = projectDir;
@@ -1165,18 +1169,41 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
   /**
    * Start monitoring workers for completion
    * Polls every 10 seconds to detect session exits
+   * Protected against race conditions by preventing overlapping executions
    */
   startCompletionMonitor(): void {
     if (this.monitorInterval) {
       return; // Already monitoring
     }
 
-    this.monitorInterval = setInterval(async () => {
-      try {
-        await this.checkForCompletions();
-      } catch (error) {
-        console.error("Error checking for completions:", error);
+    // Reset error count when starting fresh
+    this.monitorErrorCount = 0;
+
+    this.monitorInterval = setInterval(() => {
+      // Prevent overlapping executions - if previous check is still running, skip
+      if (this.monitorRunning) {
+        return;
       }
+
+      this.monitorRunning = true;
+      this.checkForCompletions()
+        .then(() => {
+          this.monitorErrorCount = 0; // Reset on success
+        })
+        .catch((error) => {
+          console.error("Error checking for completions:", error);
+          this.monitorErrorCount++;
+          // Auto-stop after too many consecutive errors to prevent runaway failures
+          if (this.monitorErrorCount >= WorkerManager.MAX_MONITOR_ERRORS) {
+            console.error(
+              `Monitor encountered ${this.monitorErrorCount} consecutive errors, stopping`
+            );
+            this.stopCompletionMonitor();
+          }
+        })
+        .finally(() => {
+          this.monitorRunning = false;
+        });
     }, 10000); // Check every 10 seconds
   }
 
