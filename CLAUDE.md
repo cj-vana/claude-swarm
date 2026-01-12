@@ -32,7 +32,7 @@ This is an MCP (Model Context Protocol) server that orchestrates parallel Claude
 
 **src/state/manager.ts** - Persistent state management using the "notebook pattern". Stores session state in `.claude/orchestrator/state.json` with atomic writes (temp file + rename). Also generates `claude-progress.txt` for human readability and `init.sh` for environment setup. Manages feature context (`FeatureContext`), routing config, and protocol bindings per feature.
 
-**src/workers/manager.ts** - Manages Claude Code worker sessions via tmux. Key security pattern: prompts are passed via files (not shell strings) to prevent injection. Includes completion monitoring (10s polling), heartbeat tracking, and conflict analysis for parallel execution. Supports competitive planning mode with dual planners.
+**src/workers/manager.ts** - Manages Claude Code worker sessions via tmux. Key security pattern: prompts are passed via files (not shell strings, mode 0600) to prevent injection. Includes completion monitoring (10s polling) with circuit breaker pattern (`MAX_MONITOR_ERRORS = 5` auto-stops after repeated failures), heartbeat tracking, and conflict analysis for parallel execution. Supports competitive planning mode with dual planners.
 
 **src/workers/confidence.ts** - Multi-signal confidence scoring combining tool activity patterns (35%), self-reported confidence (35%), and output analysis (30%). Detects struggling workers via stuck loops, error patterns, and frustration language.
 
@@ -48,7 +48,7 @@ The protocol system enables behavioral constraints on workers. Located in `src/p
 
 **registry.ts** - Protocol storage, activation status, and violation tracking. Persists to `.claude/orchestrator/protocols/`. Implements `ProtocolRegistryLike` interface for resolver compatibility. Maintains audit log of all protocol operations.
 
-**enforcement.ts** - Pre/post execution validation engine. Validates worker actions against active protocol constraints. Supports learning mode for protocol development.
+**enforcement.ts** - Pre/post execution validation engine. Validates worker actions against active protocol constraints. Supports learning mode for protocol development. Memory-bounded with `MAX_OBSERVED_PATTERNS = 100` and `MAX_ACTIVE_ALERTS = 50` using LRU eviction when limits are reached.
 
 **resolver.ts** - Resolves effective constraints by merging multiple active protocols, handling inheritance (`extends`), and conflict resolution based on priority.
 
@@ -99,7 +99,15 @@ Located in `src/setup/`:
 
 **src/utils/plan-evaluator.ts** - Compares competing implementation plans, scoring on completeness, risk mitigation, and testing coverage.
 
-**src/utils/security.ts** - Path traversal prevention, feature ID validation, session name validation, command allowlist enforcement, and output sanitization. The `ALLOWED_COMMAND_PATTERNS` regex list controls which verification commands can run.
+**src/utils/security.ts** - Comprehensive security utilities:
+- `validatePath()` - Path traversal prevention with symlink detection
+- `validateFeatureId()` - Feature ID format validation
+- `validateSessionName()` - Session name sanitization
+- `isAllowedCommand()` - Command allowlist enforcement via `ALLOWED_COMMAND_PATTERNS`
+- `sanitizeOutput()` - Output sanitization for logs
+- `isDangerousRegexPattern()` - ReDoS pattern detection (nested quantifiers, overlapping alternation, range quantifiers, non-capturing groups)
+- `safeRegexTest()` - Safe regex testing with automatic fallback to literal matching for dangerous patterns
+- `escapeRegex()` - Regex metacharacter escaping for safe pattern construction
 
 **src/utils/feature-generator.ts** - Auto-generates feature lists from task descriptions using keyword extraction and pattern matching.
 

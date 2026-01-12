@@ -259,6 +259,35 @@ setup_init(projectDir, force: true)
 setup_init(projectDir, platform: "gitlab")
 ```
 
+## Feature Rollback
+
+The orchestrator creates git snapshot branches before each worker starts, enabling safe rollback of failed features.
+
+### How Rollback Works
+
+1. **Snapshot Creation**: `start_worker` creates `swarm/{featureId}` branch at current HEAD
+2. **Worker Execution**: Worker makes changes to working directory
+3. **On Failure**: Use `rollback_feature` to restore pre-worker state
+
+### Rollback Tools
+
+| Tool | Description |
+|------|-------------|
+| `rollback_feature` | Restore files changed by a worker |
+| `check_rollback_conflicts` | Check for conflicts with other workers |
+
+### Usage
+
+```
+# Rollback all files changed by feature
+rollback_feature(projectDir, featureId: "feature-1")
+
+# Rollback specific files only
+rollback_feature(projectDir, featureId: "feature-1", files: ["src/component.ts"])
+```
+
+**Warning**: When rolling back in parallel worker environments, other workers' changes to the same files will also be reverted.
+
 ## Web Dashboard
 
 A real-time web dashboard is available at `http://localhost:3456`:
@@ -268,6 +297,31 @@ A real-time web dashboard is available at `http://localhost:3456`:
 - **Live Terminal Output** - Real-time streaming with ANSI color support
 - **Review Worker Progress** - Code and architecture review visibility
 - **Dark Mode** - Automatic theme detection
+
+### Dashboard API
+
+The dashboard exposes a REST API for programmatic access:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/status` | GET | Session overview with elapsed time and progress summary |
+| `/api/features` | GET | Feature list with details (supports `?status=` filter) |
+| `/api/workers` | GET | All worker statuses with summary counts |
+| `/api/workers/:featureId/output` | GET (SSE) | Stream worker terminal output in real-time |
+| `/api/review-workers` | GET | Review worker statuses and findings summary |
+| `/api/review-workers/:type/output` | GET (SSE) | Stream review worker output |
+| `/api/logs` | GET | Progress log entries (supports `?limit=N`) |
+| `/api/stats` | GET | Session statistics (completion times, success rates) |
+| `/api/events` | GET (SSE) | Real-time updates for all session changes |
+| `/health` | GET | Health check endpoint |
+
+**Server-Sent Events** (`/api/events`):
+- `status` - Session status changes
+- `feature` - Feature status updates
+- `worker` - Active worker count changes
+- `reviewWorker` - Review worker status updates
+- `log` - New progress log entries
+- `heartbeat` - Keep-alive (every 15s)
 
 ## Architecture
 
@@ -446,15 +500,33 @@ your-project/
 
 ## Security
 
+### Input Validation
 - **Path traversal protection** - All file paths validated against project directory
 - **Cryptographically secure IDs** - Uses `crypto.randomUUID()`
 - **Symlink escape prevention** - Real paths validated before file operations
+- **Input validation** - All inputs validated with Zod schemas
+
+### Regex Safety (ReDoS Protection)
+- **Pattern validation** - `isDangerousRegexPattern()` detects catastrophic backtracking
+- **Safe regex testing** - `safeRegexTest()` falls back to literal matching for dangerous patterns
+- **Glob-to-regex conversion** - Proper metacharacter escaping prevents injection
+
+### Memory Safety
+- **Bounded collections** - Operation counts, alerts, and observed patterns have maximum limits
+- **LRU eviction** - Least-recently-used entries removed when limits reached
+- **Timestamp truncation** - Historical data pruned to prevent unbounded growth
+
+### Execution Safety
 - **Fail-closed enforcement** - Unknown constraint types block by default
 - **Command allowlist** - Only safe verification commands allowed
 - **No shell injection** - Uses `execFile` with arguments, prompts via files
-- **Input validation** - All inputs validated with Zod schemas
-- **Base constraints** - Immutable security rules cannot be overridden
+- **Circuit breaker pattern** - Monitor auto-stops after repeated failures
 - **Review worker isolation** - Read-only tools (no Bash access)
+
+### Protocol Security
+- **Base constraints** - Immutable security rules cannot be overridden
+- **Proposal validation** - LLM-generated protocols checked against security boundaries
+- **Token-based matching** - Tool prohibition uses exact token matching, not substring
 
 ## Inspiration
 

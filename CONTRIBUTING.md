@@ -155,6 +155,22 @@ refactor(protocols): extract constraint evaluation logic
 - Commands must match `ALLOWED_COMMAND_PATTERNS` in security.ts
 - Never pass user input directly to shell commands
 
+**Regex Safety (ReDoS Prevention)**
+- Never create `new RegExp()` with user input directly
+- Use `safeRegexTest()` for all pattern matching operations
+- Test patterns with `isDangerousRegexPattern()` before using
+- Escape user input with `escapeRegex()` when building patterns
+
+**Memory Safety**
+- Add bounds to any growing collections (Maps, Arrays, Sets)
+- Use LRU eviction or periodic cleanup for caches
+- Truncate historical data after filtering (see `enforcement.ts` for examples)
+
+**Async Safety**
+- Prevent overlapping async executions with mutex patterns
+- Add error counting and circuit breakers to monitors/intervals
+- Always handle promise rejections
+
 **Error Handling**
 - Return structured errors with `{ success: false, error: message }`
 - Log errors with context for debugging
@@ -185,6 +201,24 @@ refactor(protocols): extract constraint evaluation logic
    ```
 
 3. Update CLAUDE.md to document the new tool
+
+### Testing Security Features
+
+When adding security-related code:
+
+1. **Test with malicious inputs:**
+   - Patterns like `(a+)+b`, `(?:x+)+`, `(a{1,10}){2,}` (ReDoS)
+   - Path traversal attempts: `../../../etc/passwd`
+   - Null/undefined values in all string parameters
+
+2. **Test bounds:**
+   - Verify collections don't grow unbounded
+   - Confirm LRU eviction works correctly
+   - Check memory usage under load
+
+3. **Test fail-closed behavior:**
+   - Invalid inputs should block, not allow
+   - Errors should fail safely, not open holes
 
 ### Adding a New Setup Configuration
 

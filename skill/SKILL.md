@@ -499,6 +499,29 @@ Me: I'll add Python CI while preserving your existing templates.
 [commit_progress: "ci: add GitHub Actions workflow for Python"]
 ```
 
+## Security Considerations
+
+### Protocol Safety
+
+Protocols are validated against immutable base constraints that cannot be overridden:
+- **Prohibited tools**: Dangerous system commands (rm -rf, sudo, etc.)
+- **Protected paths**: System directories, SSH keys, credentials
+- **Privilege ceiling**: Maximum permissions any protocol can grant
+
+### Worker Isolation
+
+Workers operate with limited capabilities:
+- **Implementation workers**: Bash, Read, Write, Edit, Glob, Grep only
+- **Review workers**: Read-only (no Bash access)
+- **Planner workers**: Read-only tools for analysis
+
+### Safe Pattern Matching
+
+The orchestrator uses safe regex handling:
+- Dangerous patterns (ReDoS) are detected and fall back to literal matching
+- User input is never passed directly to regex engines
+- Glob patterns are safely converted with proper escaping
+
 ## Troubleshooting
 
 ### "No active session"
@@ -528,3 +551,21 @@ Use `orchestrator_reset` with confirm=true to kill all workers and clear state.
 1. `get_violations` to see what was violated
 2. Fix the issue or `resolve_violation` if false positive
 3. Adjust protocol constraints if too strict
+
+### Memory issues
+If the orchestrator seems slow or unresponsive:
+1. Check active session size: `orchestrator_status`
+2. Clear old violations: `resolve_violation` for old entries
+3. Reset if necessary: `orchestrator_reset`
+
+### Pattern matching issues
+If protocol patterns aren't matching as expected:
+1. Patterns use regex syntax (not glob by default)
+2. Very complex patterns may fall back to literal matching for safety
+3. Use simpler patterns if exact matching fails
+
+### Monitor not running
+If workers aren't being tracked:
+1. The monitor auto-stops after 5 consecutive errors
+2. Check MCP server logs for error messages
+3. Restart the MCP server if needed
