@@ -323,6 +323,10 @@ rollback_feature(projectDir, featureId: "feature-1", files: ["src/component.ts"]
 
 ## Web Dashboard
 
+![Claude Swarm Dashboard](assets/dashboard.png)
+
+![Active Workers Panel](assets/dashboard-workers.png)
+
 A real-time web dashboard is available at `http://localhost:3456`:
 
 - **Session Overview** - Progress bar, feature counts, session statistics
@@ -358,36 +362,9 @@ The dashboard exposes a REST API for programmatic access:
 
 ## Architecture
 
-```
-+-----------------------------------------------------------------------+
-|                          MCP Server                                    |
-|              (Persistent state, survives compaction)                   |
-|                                                                        |
-|  +--------------+  +--------------+  +--------------+                 |
-|  |    State     |  |    Worker    |  |   Protocol   |                 |
-|  |   Manager    |  |   Manager    |  |   Registry   |                 |
-|  +--------------+  +--------------+  +--------------+                 |
-|         |                 |                  |                         |
-|  +------+-----------------+------------------+------------------------+|
-|  |  Enforcement Engine  |  Resolver  |  Context Enricher             ||
-|  +--------------------------------------------------------------------+|
-|                              |                                         |
-|  +---------------------------+----------------------------------------+|
-|  |  Review Manager  |  Complexity Detector  |  Plan Evaluator        ||
-|  +--------------------------------------------------------------------+|
-|                              |                                         |
-|  +---------------------------+----------------------------------------+|
-|  |                     Web Dashboard (SSE)                            ||
-|  +--------------------------------------------------------------------+|
-+--------------------------------+--------------------------------------+
-                                 | MCP Protocol
-+--------------------------------+--------------------------------------+
-|                         Claude Code                                    |
-|                                                                        |
-|      Context compacts -> Just call orchestrator_status                 |
-|      Protocol violations -> Automatic blocking/warning                 |
-+-----------------------------------------------------------------------+
-```
+![Claude Swarm Architecture](assets/architecture.png)
+
+*Claude Code orchestrates workers through the MCP Server. Workers run in isolated tmux sessions and share access to the project codebase. The dashboard provides real-time monitoring via SSE.*
 
 ## MCP Tools Reference
 
