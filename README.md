@@ -1,6 +1,21 @@
-# Claude Swarm
+<p align="center">
+  <img src="assets/banner.png" alt="Claude Swarm - Parallel AI Workers" width="100%">
+</p>
 
-An MCP server for orchestrating parallel Claude Code worker swarms with protocol-based behavioral governance. Enables multi-hour autonomous coding sessions with persistent state, parallel workers, and runtime enforcement of behavioral constraints.
+<p align="center">
+  <strong>An MCP server for orchestrating parallel Claude Code worker swarms with protocol-based behavioral governance.</strong><br>
+  Enables multi-hour autonomous coding sessions with persistent state, parallel workers, and runtime enforcement of behavioral constraints.
+</p>
+
+<p align="center">
+  <a href="#installation">Installation</a> •
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#web-dashboard">Dashboard</a> •
+  <a href="#protocol-system">Protocols</a> •
+  <a href="#mcp-tools-reference">Tools</a>
+</p>
+
+---
 
 ## Features
 
