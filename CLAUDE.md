@@ -10,6 +10,10 @@ npm run dev           # Watch mode for TypeScript compilation
 npm start             # Run the compiled MCP server
 npm run inspector     # Debug with MCP Inspector
 npx tsc --noEmit      # Type-check without emitting (CI validation)
+npm test              # Run all tests with Vitest
+npm run test:watch    # Run tests in watch mode
+npm run test:coverage # Run tests with coverage report
+npx vitest run src/utils/security.test.ts  # Run a single test file
 ```
 
 **Install the MCP server** into Claude Code:
@@ -68,7 +72,15 @@ The protocol system enables behavioral constraints on workers. Located in `src/p
 
 Located in `src/setup/`:
 
-**manager.ts** - Orchestrates repository configuration with platform detection (GitHub, GitLab, Gitea, Bitbucket, Azure DevOps). Analyzes project structure to detect languages, frameworks, and package managers. Generates setup features for missing configurations and builds prompts for worker execution.
+**manager.ts** - Orchestrates repository configuration with platform detection (GitHub, GitLab, Gitea, Bitbucket, Azure DevOps). Generates setup features for missing configurations and builds prompts for worker execution.
+
+**analyzer.ts** - Project structure analysis detecting languages, frameworks, and package managers. Identifies existing configurations and calculates repository "freshness" score.
+
+**detector.ts** - Language and framework detection utilities. Scans for package manifests (package.json, Cargo.toml, pyproject.toml, etc.) and identifies test frameworks, build tools.
+
+**platforms.ts** - Platform-specific configuration adapters. Maps generic configs to GitHub, GitLab, Gitea, Bitbucket, and Azure DevOps formats.
+
+**merge-strategy.ts** - Handles merging new configurations with existing files. Supports JSON, YAML, and markdown merge modes.
 
 **generator.ts** - Template generators for repository configuration files:
 - `generateClaudeMd()` - Project-specific CLAUDE.md
@@ -112,6 +124,12 @@ Located in `src/setup/`:
 **src/utils/feature-generator.ts** - Auto-generates feature lists from task descriptions using keyword extraction and pattern matching.
 
 **src/utils/format.ts** - Formatting utilities for consistent output across tools (compact vs pretty modes).
+
+**src/utils/validation.ts** - Common validation utilities for user inputs, feature IDs, and session names.
+
+**src/utils/git-verification.ts** - Git operation verification utilities. Validates git state, checks for uncommitted changes, and verifies branch existence.
+
+**src/utils/prompt-templates.ts** - Prompt templates for worker instructions. Centralizes prompts for consistency across worker types.
 
 ### Key Design Patterns
 

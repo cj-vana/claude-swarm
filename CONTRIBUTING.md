@@ -163,8 +163,9 @@ refactor(protocols): extract constraint evaluation logic
 
 **Memory Safety**
 - Add bounds to any growing collections (Maps, Arrays, Sets)
-- Use LRU eviction or periodic cleanup for caches
+- Use LRU eviction or periodic cleanup for caches (see `proposal-manager.ts` for LRU example)
 - Truncate historical data after filtering (see `enforcement.ts` for examples)
+- Use `MAX_CACHE_SIZE` constants to cap singleton caches
 
 **Async Safety**
 - Prevent overlapping async executions with mutex patterns

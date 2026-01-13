@@ -64,14 +64,34 @@ Tell Claude to use the swarm:
 Use /swarm to build a REST API with authentication, user management, and tests
 ```
 
-Or manually orchestrate:
+Or follow the workflow phases manually:
 
 ```
-1. orchestrator_init - Initialize session with features
-2. start_parallel_workers - Launch workers for multiple features
-3. check_all_workers - Monitor all workers at once
-4. mark_complete - Mark features done (auto-retry on failure)
-5. commit_progress - Git checkpoint
+Phase 1: Setup
+  → orchestrator_init - Initialize session with features
+  → configure_verification - Set up test/build commands
+  → set_dependencies - Define feature order
+
+Phase 2: Pre-Work (per feature)
+  → get_feature_complexity - Check if competitive planning needed
+  → enrich_feature - Add relevant context
+
+Phase 3: Execute
+  → start_worker or start_parallel_workers
+
+Phase 4: Monitor
+  → sleep 180 - Wait before checking
+  → check_worker (heartbeat: true) - Lightweight status
+  → send_worker_message - Guide if stuck
+
+Phase 5: Complete
+  → run_verification - Run tests
+  → mark_complete - Record success/failure
+  → commit_progress - Git checkpoint
+
+Phase 6: Review
+  → check_reviews - Monitor automated reviews
+  → get_review_results - See findings
 ```
 
 ## Protocol System
@@ -397,7 +417,7 @@ The dashboard exposes a REST API for programmatic access:
 | `add_feature` | Add discovered work |
 | `set_dependencies` | Define feature dependencies |
 
-### Session & Progress (5 tools)
+### Session & Progress (6 tools)
 | Tool | Description |
 |------|-------------|
 | `get_progress_log` | View history (paginated) |
@@ -405,6 +425,13 @@ The dashboard exposes a REST API for programmatic access:
 | `pause_session` | Pause and stop all workers |
 | `resume_session` | Resume paused session |
 | `commit_progress` | Create git checkpoint |
+| `auto_orchestrate` | Hands-free orchestration until completion |
+
+### Feature Rollback (2 tools)
+| Tool | Description |
+|------|-------------|
+| `rollback_feature` | Restore files changed by a worker |
+| `check_rollback_conflicts` | Check for conflicts with other workers |
 
 ### Post-Completion Reviews (5 tools)
 | Tool | Description |
@@ -513,8 +540,12 @@ your-project/
 
 ### Memory Safety
 - **Bounded collections** - Operation counts, alerts, and observed patterns have maximum limits
-- **LRU eviction** - Least-recently-used entries removed when limits reached
+- **LRU eviction** - Least-recently-used entries removed when limits reached (max 50 cached managers)
 - **Timestamp truncation** - Historical data pruned to prevent unbounded growth
+
+### Network Safety
+- **Localhost-only CORS** - Dashboard only accepts requests from localhost origins
+- **No external network access** - Workers operate in isolated tmux sessions
 
 ### Execution Safety
 - **Fail-closed enforcement** - Unknown constraint types block by default

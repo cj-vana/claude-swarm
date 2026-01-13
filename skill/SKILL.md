@@ -14,69 +14,193 @@ The orchestrator pattern separates concerns:
 - **Workers**: Focused Claude Code sessions that implement individual features
 - **Protocols**: Behavioral constraints that govern what workers can/cannot do
 
-## Quick Start
+---
 
-### 1. Initialize a Session
+## Complete Workflow (Step-by-Step)
 
-First, analyze the task and decompose it into features:
+Follow these phases in order for every swarm session:
 
-```
-Task: "Build a user authentication system"
-
-Features:
-1. Create user registration endpoint with validation
-2. Implement password hashing with bcrypt
-3. Add JWT token generation and verification
-4. Create login endpoint
-5. Add protected route middleware
-6. Implement logout and token invalidation
-```
-
-Then initialize:
-```
-Use orchestrator_init with:
-- projectDir: /path/to/project
-- taskDescription: "Build a user authentication system with..."
-- existingFeatures: [list of feature descriptions above]
-```
-
-### 2. Work Loop
-
-**IMPORTANT: Workers typically take 5-10 minutes per feature.** Do NOT check workers immediately after starting them.
-
-For each pending feature:
+### Phase 1: Session Setup
 
 ```
-1. start_worker for the feature (or start_parallel_workers for independent features)
-2. WAIT 2-3 minutes before first check (use: sleep 120 or sleep 180)
-3. check_worker to monitor progress
-4. If still working, wait another 2-3 minutes before checking again
-5. Use send_worker_message if worker needs additional guidance
-6. When worker completes, run_verification (tests, build, etc.)
-7. mark_complete with success/failure (auto-retry enabled by default)
-8. commit_progress to checkpoint
-9. Repeat for next feature
+1. DECOMPOSE the task into 15-60 minute features
+   - Each feature should be independently testable
+   - Order by dependency (foundations first)
+
+2. INITIALIZE the session:
+   → orchestrator_init(projectDir, taskDescription, existingFeatures)
+
+3. OPTIONAL - Set up behavioral constraints:
+   → protocol_register(protocol JSON)
+   → protocol_activate(protocolId)
+
+4. OPTIONAL - Configure pre-completion verification:
+   → configure_verification(commands: ["npm test", "tsc --noEmit"])
+
+5. OPTIONAL - Set feature dependencies:
+   → set_dependencies(featureId, dependsOn: ["feature-1", "feature-2"])
 ```
 
-For parallel execution:
+### Phase 2: Pre-Work Analysis (Per Feature)
+
+Before starting each feature, analyze and prepare:
+
 ```
-1. Identify independent features (no dependencies between them)
-2. Use set_dependencies if features must be ordered
-3. Use validate_workers to check for conflicts before starting
-4. start_parallel_workers with multiple feature IDs
-5. Run: sleep 180 (wait 3 minutes before checking)
-6. Use check_all_workers to monitor all workers at once
-7. Mark each complete as they finish
+1. CHECK COMPLEXITY:
+   → get_feature_complexity(featureId)
+
+2. IF complexity score >= 60 (complex feature):
+   → start_competitive_planning(featureId)
+   → sleep 300  (wait 5 minutes for planners)
+   → evaluate_plans(featureId)  # Selects winning plan
+
+3. OPTIONAL - Enrich with context:
+   → enrich_feature(featureId)  # Auto-finds relevant docs/code
+
+4. OPTIONAL - Validate against protocols:
+   → validate_feature_protocols(featureId)
 ```
 
-### 3. After Context Compaction
+### Phase 3: Execution
 
-If your context is compacted, simply:
+Choose parallel or sequential based on feature independence:
+
 ```
-Call orchestrator_status with the projectDir
+FOR INDEPENDENT FEATURES (can run simultaneously):
+   → validate_workers(featureIds)  # Check for conflicts
+   → start_parallel_workers(featureIds)  # Up to 10 workers
+
+FOR DEPENDENT/SEQUENTIAL FEATURES:
+   → start_worker(featureId)
 ```
 
-This restores your understanding of the current state from the persistent MCP server.
+### Phase 4: Monitoring Loop
+
+**IMPORTANT: Workers take 5-10 minutes. Do NOT check immediately.**
+
+```
+1. WAIT before first check:
+   → sleep 180  (3 minutes)
+
+2. CHECK status (lightweight):
+   → check_worker(featureId, heartbeat: true)
+   OR
+   → check_all_workers(heartbeat: true)
+
+3. IF worker seems stuck (low confidence):
+   → get_worker_confidence(featureId)
+   → send_worker_message(featureId, "guidance here")
+
+4. IF still running:
+   → sleep 120  (wait 2 more minutes)
+   → Repeat from step 2
+
+5. IF completed:
+   → Proceed to Phase 5
+```
+
+### Phase 5: Completion (Per Feature)
+
+```
+1. VERIFY the work:
+   → run_verification(command: "npm test")
+
+2. MARK completion:
+   → mark_complete(featureId, success: true/false)
+   - If failed: auto-retry enabled (3 attempts by default)
+   - If retries exhausted: retry_feature(featureId) to reset
+
+3. CHECKPOINT (on success):
+   → commit_progress("feat: description of work")
+
+4. REPEAT Phases 2-5 for next pending feature
+```
+
+### Phase 6: Post-Completion Reviews
+
+After ALL features complete, reviews run automatically:
+
+```
+1. MONITOR review progress:
+   → check_reviews()
+
+2. GET findings when complete:
+   → get_review_results()
+
+3. OPTIONAL - Create follow-up features from issues:
+   → implement_review_suggestions(autoSelect: true, minSeverity: "warning")
+
+4. IF new features added:
+   → Repeat from Phase 2
+```
+
+### Recovery Points
+
+```
+LOST CONTEXT (after compaction)?
+   → orchestrator_status(projectDir)  # Restores full state
+
+NEED TO PAUSE?
+   → pause_session()   # Stops all workers
+   → resume_session()  # Continue later
+
+NEED TO ABORT?
+   → orchestrator_reset(confirm: true)  # Nuclear option
+
+FEATURE FAILED REPEATEDLY?
+   → rollback_feature(featureId)  # Restore to pre-worker state
+   → retry_feature(featureId)     # Reset attempt counter
+```
+
+---
+
+## Quick Reference Flowchart
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         SESSION START                            │
+└─────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 1: orchestrator_init + optional protocols/verification   │
+└─────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 2: get_feature_complexity                                 │
+│           ├─ IF >= 60: start_competitive_planning → evaluate     │
+│           └─ OPTIONAL: enrich_feature                            │
+└─────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 3: start_worker OR start_parallel_workers                 │
+└─────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 4: sleep 180 → check_worker → (loop until complete)      │
+│           └─ IF stuck: get_worker_confidence, send_worker_message│
+└─────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 5: run_verification → mark_complete → commit_progress     │
+│           └─ Repeat Phase 2-5 for remaining features             │
+└─────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 6: check_reviews → get_review_results                     │
+│           └─ OPTIONAL: implement_review_suggestions              │
+└─────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+                            SESSION END
+```
+
+---
 
 ## Protocol-Based Governance
 

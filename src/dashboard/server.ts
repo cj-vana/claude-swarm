@@ -230,9 +230,22 @@ export async function startDashboardServer(
     }, 1000); // Check every 1 second
   };
 
-  // CORS middleware for local development
+  // CORS middleware for local development (localhost only)
+  const allowedOrigins = [
+    `http://localhost:${port}`,
+    `http://127.0.0.1:${port}`,
+    "http://localhost:3456",
+    "http://127.0.0.1:3456",
+  ];
+
   app.use((req: Request, res: Response, next: NextFunction) => {
-    res.header("Access-Control-Allow-Origin", "*");
+    const origin = req.headers.origin;
+    if (origin && allowedOrigins.includes(origin)) {
+      res.header("Access-Control-Allow-Origin", origin);
+    } else if (!origin) {
+      // Allow requests without origin (same-origin, curl, etc.)
+      res.header("Access-Control-Allow-Origin", `http://localhost:${port}`);
+    }
     res.header("Access-Control-Allow-Methods", "GET, OPTIONS");
     res.header("Access-Control-Allow-Headers", "Content-Type");
     if (req.method === "OPTIONS") {

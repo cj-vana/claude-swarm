@@ -686,9 +686,22 @@ export function createProposalManager(
   return new ProposalManager(projectDir, registry, options?.customValidator);
 }
 
-// Singleton instance cache per project
+// Singleton instance cache per project with LRU eviction
+const MAX_CACHE_SIZE = 50;
 const managerCache = new Map<string, ProposalManager>();
 const registryCache = new Map<string, ProtocolRegistry>();
+
+/**
+ * Evict oldest entry if cache exceeds max size (simple LRU via Map insertion order)
+ */
+function evictOldestIfNeeded<T>(cache: Map<string, T>): void {
+  if (cache.size >= MAX_CACHE_SIZE) {
+    const firstKey = cache.keys().next().value;
+    if (firstKey !== undefined) {
+      cache.delete(firstKey);
+    }
+  }
+}
 
 /**
  * Get or create a proposal manager for a project (cached singleton)
@@ -696,15 +709,24 @@ const registryCache = new Map<string, ProtocolRegistry>();
 export function getProposalManager(projectDir: string): ProposalManager {
   const existing = managerCache.get(projectDir);
   if (existing) {
+    // Move to end for LRU (delete and re-add)
+    managerCache.delete(projectDir);
+    managerCache.set(projectDir, existing);
     return existing;
   }
 
   let registry = registryCache.get(projectDir);
   if (!registry) {
+    evictOldestIfNeeded(registryCache);
     registry = new ProtocolRegistry(projectDir);
+    registryCache.set(projectDir, registry);
+  } else {
+    // Move to end for LRU
+    registryCache.delete(projectDir);
     registryCache.set(projectDir, registry);
   }
 
+  evictOldestIfNeeded(managerCache);
   const manager = new ProposalManager(projectDir, registry);
   managerCache.set(projectDir, manager);
   return manager;
