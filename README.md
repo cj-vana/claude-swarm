@@ -43,6 +43,17 @@ An MCP server for orchestrating parallel Claude Code worker swarms with protocol
 
 ### Installation
 
+**One-liner install** (recommended):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cj-vana/claude-swarm/main/install.sh | bash
+```
+
+This will clone the repo, build, register the MCP server, and install the `/swarm` skill.
+
+<details>
+<summary><strong>Manual installation</strong></summary>
+
 ```bash
 git clone https://github.com/cj-vana/claude-swarm.git
 cd claude-swarm
@@ -55,6 +66,8 @@ claude mcp add claude-swarm --scope user -- node $(pwd)/dist/index.js
 # Install the skill (optional but recommended)
 mkdir -p ~/.claude/skills/swarm && cp skill/SKILL.md ~/.claude/skills/swarm/
 ```
+
+</details>
 
 ### Basic Usage
 
