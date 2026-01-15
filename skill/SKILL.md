@@ -75,7 +75,15 @@ Before starting each feature, prepare as needed based on Phase 1 complexity anal
 1. IF feature complexity >= 60 (from Phase 1 analysis):
    → start_competitive_planning(featureId)
    → sleep 300  (wait 5 minutes for planners)
-   → evaluate_plans(featureId)  # Selects winning plan
+
+   REVIEW PLANS (recommended for critical features):
+   → check_worker(plannerSessionA)  # View Planner A's output
+   → check_worker(plannerSessionB)  # View Planner B's output
+
+   EVALUATE AND SELECT:
+   → evaluate_plans(featureId)  # Automatic selection based on scoring
+   OR for manual override:
+   → evaluate_plans(featureId, manualSelection: "A", selectionReason: "...")
 
 2. OPTIONAL - Enrich with context:
    Option A: Automatic discovery
@@ -385,6 +393,106 @@ For complex features (score >= 60), use competitive planning:
 5. start_worker with the winning plan as context
 ```
 
+### Evaluating Competing Plans (Detailed Guide)
+
+After planners complete, use `evaluate_plans` to compare their approaches. Understanding the evaluation helps you decide when to accept automatic selection vs. override manually.
+
+#### Step 1: Review Planner Outputs
+
+Before evaluation, review what each planner produced:
+
+```
+# Quick status check
+check_worker(featureId, heartbeat: true)
+
+# Full output review (recommended for critical features)
+check_worker(plannerSessionA)  # View full Planner A output
+check_worker(plannerSessionB)  # View full Planner B output
+```
+
+Planners have different approaches by design:
+- **Planner A**: Focuses on incremental, low-risk changes using established patterns
+- **Planner B**: Explores alternative or more elegant approaches, looking for architectural improvements
+
+#### Step 2: Understand the Scoring System
+
+The automatic evaluation scores plans against five criteria (100 points total):
+
+| Criterion | Points | What It Measures |
+|-----------|--------|------------------|
+| **Completeness** | 25 | Steps defined (3+ ideal), feature keywords addressed, test strategy present |
+| **Feasibility** | 25 | Files to modify exist, reasonable step count (2-10), specific files listed |
+| **Risk Awareness** | 20 | Risks identified, mitigation strategies (prevent, handle, fallback, rollback) |
+| **Clarity** | 15 | Step descriptions >10 chars, validation criteria included, summary 50-500 chars |
+| **Efficiency** | 15 | Optimal step count (2-5 ideal), focused file scope (1-5 files ideal) |
+
+#### Step 3: Interpret the Results
+
+The evaluation output shows scores and a winner recommendation:
+
+```
+Winner: Plan A
+Margin: 12 points
+Reason: Plan A selected with moderate advantage. Key strength: Includes risk mitigation strategies
+
+--- Plan A (78/100) ---
+  Completeness: 22/25
+  Feasibility: 20/25
+  Risk Awareness: 18/20
+  Clarity: 10/15
+  Efficiency: 8/15
+  Strengths: Well-structured multi-step approach; Identifies 3 potential risks
+  Concerns: Large number of files may indicate scope creep
+
+--- Plan B (66/100) ---
+  ...
+```
+
+**Margin of Victory Interpretation:**
+
+| Margin | Meaning | Recommended Action |
+|--------|---------|-------------------|
+| < 5 points | Plans nearly equal | Review both manually; consider domain factors |
+| 5-15 points | Moderate advantage | Accept winner unless you have specific concerns |
+| >= 15 points | Clear superiority | Accept winner with confidence |
+
+#### Step 4: When to Use Manual Override
+
+Override automatic selection when:
+
+1. **Domain knowledge trumps metrics**: You know codebase constraints the evaluator cannot detect
+2. **Security-critical features**: One plan has better security considerations despite lower score
+3. **Team conventions**: One plan follows your team's established patterns better
+4. **Risk tolerance**: Your project needs the conservative approach even if it scores slightly lower
+5. **Close margins with red flags**: Plans nearly equal but one has concerning "Concerns" in output
+
+#### Step 5: Making Manual Selections
+
+To override, provide both the selection and reasoning:
+
+```
+evaluate_plans(
+  featureId,
+  manualSelection: "B",
+  selectionReason: "Plan B's approach aligns with our event-driven architecture migration"
+)
+```
+
+Good selection reasons include:
+- Alignment with architectural direction
+- Better handling of specific edge cases
+- Consistency with recent team decisions
+- Risk considerations for production systems
+
+**Example Override Scenarios:**
+
+| Scenario | Override To | Example Reason |
+|----------|-------------|----------------|
+| Security feature | Conservative plan | "Plan A's incremental approach allows security review at each step" |
+| Performance critical | Elegant plan | "Plan B's approach reduces database queries by 60%" |
+| Legacy integration | Established patterns | "Plan A uses the same patterns as our existing adapters" |
+| Tight deadline | Simpler plan | "Plan A has fewer moving parts, reducing implementation risk" |
+
 ### Confidence-Based Monitoring
 Track worker confidence to detect issues early:
 
@@ -443,6 +551,198 @@ implement_review_suggestions(projectDir, autoSelect: true, minSeverity: "warning
 - Commit after each successful feature with `commit_progress`
 - Use descriptive commit messages
 - Enables easy rollback if needed
+
+### When to Use Protocol Governance
+
+Protocol governance adds behavioral constraints to workers. Use it when you need:
+
+**Security Enforcement:**
+- Restrict dangerous file operations during bulk refactoring
+- Prevent accidental production data modification
+- Block execution of certain shell commands
+
+**Team Policies:**
+- Enforce code style checking before file writes
+- Limit iteration counts on long-running tasks
+- Rate limit API calls in multi-worker scenarios
+
+**Compliance & Audit:**
+- Track constraint violations for compliance reports
+- Enforce approval workflows for sensitive changes
+
+**When NOT to Use:**
+- Single-feature tasks (overhead not justified)
+- Rapid experimentation (approval slows iteration)
+- When base constraints are already sufficient
+
+### How Workers Can Propose Protocols
+
+Workers can dynamically propose new protocols, validated against immutable base constraints before human review.
+
+#### Step 1: Check Base Constraints
+
+Before proposing, understand what cannot be overridden:
+
+```
+get_base_constraints(projectDir)
+```
+
+Base constraints include:
+- **Prohibited tools**: rm -rf, sudo, chmod 777, etc.
+- **Protected paths**: ~/.ssh, .env.production, /etc/passwd
+- **Required enforcement**: Pre/post validation always enabled, 30-day audit retention
+
+#### Step 2: Design the Protocol
+
+```
+propose_protocol(
+  projectDir,
+  protocol: {
+    id: "my-protocol-v1",
+    version: "1.0.0",
+    name: "My Protocol Name",
+    description: "What this protocol does",
+    constraints: [
+      {
+        id: "constraint-1",
+        type: "file_access",        // or: tool_restriction, behavioral, temporal, etc.
+        severity: "error",          // or: warning, info
+        message: "Human-readable explanation",
+        rule: {
+          type: "file_access",
+          deniedPaths: [".env.production", "config/prod/**"]
+        }
+      }
+    ],
+    enforcement: {
+      mode: "strict",               // or: permissive, audit, learning
+      preExecutionValidation: true, // REQUIRED by base constraints
+      postExecutionValidation: true,// REQUIRED by base constraints
+      onViolation: "block",         // or: warn, log, notify
+      logLevel: "standard"
+    }
+  },
+  description: "Why this protocol is needed",
+  rationale: "Design decisions and tradeoffs"
+)
+```
+
+#### Step 3: Review Validation Results
+
+The proposal is immediately validated. Check:
+- `isValid`: Whether it passes all checks
+- `riskAssessment.overallScore`: Risk score (0-100, lower is better)
+- `recommendations`: Suggestions for improvement
+- `proposedFixes`: Auto-fixable issues
+
+**Risk Level Thresholds:**
+
+| Score | Level | Meaning |
+|-------|-------|---------|
+| 0-19 | Minimal | Very safe, likely auto-approvable |
+| 20-39 | Low | Minor concerns, should pass review |
+| 40-59 | Medium | Review carefully before approval |
+| 60-79 | High | Significant risks, may need modification |
+| 80-100 | Critical | Likely rejected, needs major changes |
+
+#### Step 4: Review and Approve
+
+```
+# List pending proposals
+review_proposals(projectDir, status: "pending")
+
+# View specific proposal details
+review_proposals(projectDir, proposalId: "prop-xxx")
+
+# Approve and optionally activate immediately
+approve_protocol(
+  projectDir,
+  proposalId: "prop-xxx",
+  reason: "Needed for parallel refactoring safety",
+  activate: true
+)
+
+# Or reject with explanation
+reject_protocol(
+  projectDir,
+  proposalId: "prop-xxx",
+  reason: "Too permissive, needs stricter file patterns"
+)
+```
+
+#### Step 5: Activate and Monitor
+
+```
+# If not activated during approval
+protocol_activate(protocolId)
+
+# Monitor violations during work
+get_violations(projectDir)
+
+# Resolve false positives
+resolve_violation(violationId, resolution: "False positive - file is test fixture")
+
+# Deactivate when done
+protocol_deactivate(protocolId)
+```
+
+### Example Protocol Scenarios
+
+**Scenario 1: Production Protection**
+```json
+{
+  "id": "prod-protection",
+  "name": "Production Config Protection",
+  "constraints": [{
+    "id": "block-prod-env",
+    "type": "file_access",
+    "severity": "error",
+    "message": "Cannot modify production config",
+    "rule": {
+      "type": "file_access",
+      "deniedPaths": [".env.production", "config/production/**"]
+    }
+  }]
+}
+```
+
+**Scenario 2: API Rate Limiting**
+```json
+{
+  "id": "api-rate-limit",
+  "name": "API Rate Limiting",
+  "constraints": [{
+    "id": "limit-requests",
+    "type": "temporal",
+    "severity": "warning",
+    "message": "Rate limit exceeded",
+    "rule": {
+      "type": "temporal",
+      "rateLimitPerMinute": 10,
+      "burstLimit": 3
+    }
+  }]
+}
+```
+
+**Scenario 3: Safe Refactoring Mode**
+```json
+{
+  "id": "safe-refactor",
+  "name": "Safe Refactoring Protocol",
+  "constraints": [{
+    "id": "read-first",
+    "type": "behavioral",
+    "severity": "warning",
+    "message": "Analyze code before modifying",
+    "rule": {
+      "type": "behavioral",
+      "maxIterations": 10,
+      "requireConfirmation": true
+    }
+  }]
+}
+```
 
 ## Web Dashboard
 
@@ -538,6 +838,13 @@ A real-time web dashboard is available at `http://localhost:3456`:
 | `review_proposals` | List pending proposals |
 | `approve_protocol` | Approve proposal |
 | `reject_protocol` | Reject proposal |
+
+**Protocol Proposal Workflow:**
+1. `get_base_constraints` - View what cannot be overridden
+2. `propose_protocol` - Submit proposal (validated immediately)
+3. `review_proposals` - See pending with risk scores
+4. `approve_protocol` / `reject_protocol` - Human decision
+5. `protocol_activate` - Enable enforcement
 
 ### Protocol Networking
 | Tool | Purpose |

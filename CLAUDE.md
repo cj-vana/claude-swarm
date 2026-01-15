@@ -13,7 +13,7 @@ npx tsc --noEmit      # Type-check without emitting (CI validation)
 npm test              # Run all tests with Vitest
 npm run test:watch    # Run tests in watch mode
 npm run test:coverage # Run tests with coverage report
-npx vitest run src/utils/security.test.ts  # Run a single test file
+npx vitest run src/utils/git-verification.test.ts  # Run a single test file
 ```
 
 **Install the MCP server** into Claude Code:
