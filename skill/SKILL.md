@@ -20,6 +20,25 @@ The orchestrator pattern separates concerns:
 
 Follow these phases in order for every swarm session:
 
+### Phase 0: Repository Readiness Check
+
+Before starting any feature work, check if the repository needs configuration:
+
+```
+1. ANALYZE the repository:
+   → setup_analyze(projectDir)
+
+2. IF freshness score >= 50 (missing configurations):
+   → setup_init(projectDir)
+   → Monitor: setup_status(projectDir)
+   → Wait for all setup workers to complete
+
+3. IF freshness score < 50:
+   → Proceed to Phase 1 (repo already configured)
+```
+
+**Why:** Ensures repos have CLAUDE.md, CI, and other essentials before feature work begins.
+
 ### Phase 1: Session Setup
 
 ```
@@ -30,48 +49,74 @@ Follow these phases in order for every swarm session:
 2. INITIALIZE the session:
    → orchestrator_init(projectDir, taskDescription, existingFeatures)
 
-3. OPTIONAL - Set up behavioral constraints:
+3. ANALYZE COMPLEXITY for all features (mandatory):
+   → FOR EACH feature:
+      get_feature_complexity(featureId)
+   - Records complexity score and recommendation for each feature
+   - Features with score >= 60 are flagged for competitive planning
+   - Use these results to inform Phase 3 execution strategy
+
+4. OPTIONAL - Set up behavioral constraints:
    → protocol_register(protocol JSON)
    → protocol_activate(protocolId)
 
-4. OPTIONAL - Configure pre-completion verification:
+5. OPTIONAL - Configure pre-completion verification:
    → configure_verification(commands: ["npm test", "tsc --noEmit"])
 
-5. OPTIONAL - Set feature dependencies:
+6. OPTIONAL - Set feature dependencies:
    → set_dependencies(featureId, dependsOn: ["feature-1", "feature-2"])
 ```
 
-### Phase 2: Pre-Work Analysis (Per Feature)
+### Phase 2: Pre-Work Preparation (Per Feature)
 
-Before starting each feature, analyze and prepare:
+Before starting each feature, prepare as needed based on Phase 1 complexity analysis:
 
 ```
-1. CHECK COMPLEXITY:
-   → get_feature_complexity(featureId)
-
-2. IF complexity score >= 60 (complex feature):
+1. IF feature complexity >= 60 (from Phase 1 analysis):
    → start_competitive_planning(featureId)
    → sleep 300  (wait 5 minutes for planners)
    → evaluate_plans(featureId)  # Selects winning plan
 
-3. OPTIONAL - Enrich with context:
+2. OPTIONAL - Enrich with context:
+   Option A: Automatic discovery
    → enrich_feature(featureId)  # Auto-finds relevant docs/code
 
-4. OPTIONAL - Validate against protocols:
+   Option B: Manual/precise context
+   → set_feature_context(featureId, documentation: [...])
+
+3. OPTIONAL - Validate against protocols:
    → validate_feature_protocols(featureId)
 ```
 
+**When to enrich:** Use for complex features touching unfamiliar code areas. Skip for simple, isolated changes.
+
 ### Phase 3: Execution
 
-Choose parallel or sequential based on feature independence:
+Choose your execution strategy:
 
 ```
+OPTION A: Manual Orchestration (Default)
+
 FOR INDEPENDENT FEATURES (can run simultaneously):
    → validate_workers(featureIds)  # Check for conflicts
    → start_parallel_workers(featureIds)  # Up to 10 workers
 
 FOR DEPENDENT/SEQUENTIAL FEATURES:
    → start_worker(featureId)
+
+---
+
+OPTION B: Hands-Free Orchestration
+
+For fully autonomous execution until completion:
+   → auto_orchestrate(projectDir, strategy: "adaptive", maxConcurrent: 5)
+
+Strategies:
+- breadth-first: Parallelize independent features first
+- depth-first: Focus on unblocking dependent features
+- adaptive: Let the system decide based on dependencies
+
+Note: auto_orchestrate handles Phases 3-5 automatically, returning when all features complete.
 ```
 
 ### Phase 4: Monitoring Loop
@@ -148,9 +193,15 @@ NEED TO ABORT?
    → orchestrator_reset(confirm: true)  # Nuclear option
 
 FEATURE FAILED REPEATEDLY?
-   → rollback_feature(featureId)  # Restore to pre-worker state
+   → retry_feature(featureId)     # Reset attempt counter and try again
+
+FEATURE FAILED AND NEEDS ROLLBACK?
+   → check_rollback_conflicts(featureId)  # Check for conflicts with parallel workers
+   → rollback_feature(featureId)  # Restore files to pre-worker state
    → retry_feature(featureId)     # Reset attempt counter
 ```
+
+**Rollback Warning:** In parallel environments, rolling back can affect files modified by other concurrent workers. Always run `check_rollback_conflicts` first to see which files would be affected.
 
 ---
 
@@ -163,24 +214,31 @@ FEATURE FAILED REPEATEDLY?
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  Phase 1: orchestrator_init + optional protocols/verification   │
+│  Phase 0: setup_analyze → IF score >= 50: setup_init             │
+│           └─ Wait for repo configuration if needed               │
 └─────────────────────────────────────────────────────────────────┘
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  Phase 2: get_feature_complexity                                 │
-│           ├─ IF >= 60: start_competitive_planning → evaluate     │
-│           └─ OPTIONAL: enrich_feature                            │
+│  Phase 1: orchestrator_init + get_feature_complexity (all)       │
+│           └─ Optional: protocols, verification, dependencies     │
+└─────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 2: IF complexity >= 60: competitive_planning → evaluate   │
+│           └─ Optional: enrich_feature, validate_feature_protocols│
 └─────────────────────────────────────────────────────────────────┘
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  Phase 3: start_worker OR start_parallel_workers                 │
+│           └─ OR: auto_orchestrate (hands-free execution)         │
 └─────────────────────────────────────────────────────────────────┘
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  Phase 4: sleep 180 → check_worker → (loop until complete)      │
+│  Phase 4: sleep 180 → check_worker → (loop until complete)       │
 │           └─ IF stuck: get_worker_confidence, send_worker_message│
 └─────────────────────────────────────────────────────────────────┘
                                  │
@@ -193,7 +251,7 @@ FEATURE FAILED REPEATEDLY?
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  Phase 6: check_reviews → get_review_results                     │
-│           └─ OPTIONAL: implement_review_suggestions              │
+│           └─ Optional: implement_review_suggestions              │
 └─────────────────────────────────────────────────────────────────┘
                                  │
                                  ▼
@@ -266,6 +324,26 @@ Workers can propose new protocols validated against immutable base constraints:
 2. propose_protocol - Worker submits proposal
 3. review_proposals - See pending proposals with risk scores
 4. approve_protocol / reject_protocol - Human review for high-risk
+```
+
+### Sharing Protocols Across Projects
+
+Protocols can be exported, shared, and synchronized across MCP instances:
+
+```
+EXPORT protocols from current project:
+   → export_protocols(projectDir, protocolIds: [...])
+   - Creates a shareable bundle file
+   - Optionally sign for integrity verification
+
+IMPORT protocols from bundle:
+   → import_protocols(projectDir, bundlePath: "path/to/bundle.json")
+   - Validates against base constraints
+   - Conflict strategies: skip, replace, rename, merge
+
+SYNC with peer instances:
+   → discover_protocols(projectDir)  # Find available peers
+   → sync_protocols(projectDir, direction: "pull")  # Get protocols from peers
 ```
 
 ## Best Practices
@@ -461,16 +539,69 @@ A real-time web dashboard is available at `http://localhost:3456`:
 | `approve_protocol` | Approve proposal |
 | `reject_protocol` | Reject proposal |
 
+### Protocol Networking
+| Tool | Purpose |
+|------|---------|
+| `export_protocols` | Export protocols to shareable bundle |
+| `import_protocols` | Import protocols from bundle file |
+| `discover_protocols` | Find protocols on peer MCP instances |
+| `sync_protocols` | Sync protocols bidirectionally with peers |
+
+### Setup & Analysis
+| Tool | Purpose |
+|------|---------|
+| `setup_analyze` | Check repository freshness and missing configs |
+| `setup_init` | Initialize repo with auto-detected configurations |
+| `setup_status` | Monitor progress of setup operation |
+
+### Context Management
+| Tool | Purpose |
+|------|---------|
+| `enrich_feature` | Auto-enrich feature with relevant docs/code |
+| `set_feature_context` | Manually set context, docs, and protocol bindings |
+| `get_feature_graph` | View dependency graph with context info |
+| `route_feature` | Configure worker routing and capabilities |
+
+### Rollback
+| Tool | Purpose |
+|------|---------|
+| `rollback_feature` | Restore files to pre-worker state |
+| `check_rollback_conflicts` | Check for conflicts before rollback |
+
+### Automation
+| Tool | Purpose |
+|------|---------|
+| `auto_orchestrate` | Hands-free orchestration until completion |
+
 ## Example Session
 
 ```
 User: "Build a REST API for a todo app with CRUD operations"
 
-[Analyze and decompose into features]
+═══════════════════════════════════════════════════════════════════
+PHASE 0: REPOSITORY READINESS CHECK
+═══════════════════════════════════════════════════════════════════
 
-Me: I'll orchestrate building this API. Let me initialize the session.
+Me: Let me check if this repository needs setup first.
 
-[Call orchestrator_init with features:
+[setup_analyze(projectDir)]
+→ Freshness score: 75 (missing CLAUDE.md and CI workflow)
+
+Since score >= 50, running setup...
+
+[setup_init(projectDir)]
+→ Setup workers started for CLAUDE.md, GitHub CI...
+
+[setup_status(projectDir)]
+→ All setup workers complete. Repo is now configured.
+
+═══════════════════════════════════════════════════════════════════
+PHASE 1: SESSION SETUP
+═══════════════════════════════════════════════════════════════════
+
+Me: Now I'll decompose the task and initialize the session.
+
+[orchestrator_init with features:
 1. Set up Express server with basic middleware
 2. Create Todo model with Mongoose
 3. Implement POST /todos endpoint
@@ -483,28 +614,104 @@ Me: I'll orchestrate building this API. Let me initialize the session.
 
 Session initialized with 9 features.
 
-[start_worker for feature-1]
-Worker started: cc-worker-feature-1-abc123
+Now analyzing complexity for all features...
 
-[Run: sleep 180]  # Wait 3 minutes before first check
+[get_feature_complexity for each feature-1 through feature-9]
 
-[check_worker for feature-1]
-Worker output shows Express setup complete...
+Results:
+- feature-1 (Express setup): score 35, recommendation: simple
+- feature-2 (Mongoose model): score 25, recommendation: simple
+- feature-3 through feature-6 (CRUD): scores 20-30, recommendation: simple
+- feature-7 (validation): score 45, recommendation: manual_review
+- feature-8 (error handling): score 50, recommendation: manual_review
+- feature-9 (integration tests): score 65, recommendation: competitive_planning ← FLAG
 
-[run_verification: "npm run build"]
-Build passed!
+One feature (tests) flagged for competitive planning.
 
-[mark_complete: feature-1, success: true]
-[commit_progress: "feat: set up Express server"]
+═══════════════════════════════════════════════════════════════════
+PHASE 2: PRE-WORK PREPARATION (for feature-9)
+═══════════════════════════════════════════════════════════════════
 
-Moving to feature-2...
-[start_worker for feature-2]
-...
+Since feature-9 has complexity >= 60, using competitive planning:
 
-[Continue until all features complete]
-[Automatic code and architecture reviews run]
-[get_review_results to see findings]
-[implement_review_suggestions to create follow-up features if needed]
+[start_competitive_planning(feature-9)]
+→ Planners A and B started...
+
+[sleep 300]  # Wait 5 minutes for planners
+
+[evaluate_plans(feature-9)]
+→ Plan A selected: comprehensive Jest test suite with mocking strategy
+
+═══════════════════════════════════════════════════════════════════
+PHASE 3: EXECUTION
+═══════════════════════════════════════════════════════════════════
+
+Starting with simple features in parallel:
+
+[validate_workers([feature-1, feature-2, feature-3, feature-4])]
+→ No conflicts detected.
+
+[start_parallel_workers([feature-1, feature-2, feature-3, feature-4])]
+→ 4 workers started in parallel.
+
+═══════════════════════════════════════════════════════════════════
+PHASE 4: MONITORING
+═══════════════════════════════════════════════════════════════════
+
+[sleep 180]  # Wait 3 minutes before first check
+
+[check_all_workers(heartbeat: true)]
+→ All 4 workers still running...
+
+[sleep 120]
+
+[check_all_workers(heartbeat: true)]
+→ Workers completed: feature-1, feature-2, feature-3, feature-4
+
+═══════════════════════════════════════════════════════════════════
+PHASE 5: COMPLETION
+═══════════════════════════════════════════════════════════════════
+
+[run_verification("npm run build")]
+→ Build passed!
+
+[mark_complete(feature-1, success: true)]
+[mark_complete(feature-2, success: true)]
+[mark_complete(feature-3, success: true)]
+[mark_complete(feature-4, success: true)]
+
+[commit_progress("feat: add Express server, Mongoose model, and basic CRUD endpoints")]
+
+═══════════════════════════════════════════════════════════════════
+CONTINUE WITH REMAINING FEATURES
+═══════════════════════════════════════════════════════════════════
+
+[start_parallel_workers([feature-5, feature-6, feature-7, feature-8])]
+... (monitoring and completion cycle)
+
+[start_worker(feature-9)]  # Uses winning plan from competitive planning
+... (monitoring and completion cycle)
+
+═══════════════════════════════════════════════════════════════════
+PHASE 6: POST-COMPLETION REVIEWS
+═══════════════════════════════════════════════════════════════════
+
+All features complete. Automatic reviews starting...
+
+[check_reviews()]
+→ Reviews in progress: code-review, architecture-review
+
+[sleep 180]
+
+[get_review_results()]
+→ Code review: 2 warnings (missing error handling in 2 places)
+→ Architecture review: 1 suggestion (consider middleware consolidation)
+
+[implement_review_suggestions(autoSelect: true, minSeverity: "warning")]
+→ Created feature-10: Add missing error handling
+→ Created feature-11: Consolidate middleware
+
+[Continue from Phase 2 with new features...]
 ```
 
 ## Repo Setup

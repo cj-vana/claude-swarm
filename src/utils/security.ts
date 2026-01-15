@@ -114,6 +114,14 @@ const ALLOWED_COMMAND_PATTERNS = [
   /^pnpm\s+(test|run\s+(test|lint|build|check|typecheck))(\s+.*)?$/,
   /^npx\s+(vitest|jest|playwright|cypress)(\s+.*)?$/,
 
+  // Bun
+  /^bun\s+test(\s+.*)?$/,
+  /^bun\s+run\s+(test|lint|build|check|typecheck)(\s+.*)?$/,
+
+  // Deno
+  /^deno\s+(test|check|lint)(\s+.*)?$/,
+  /^deno\s+fmt\s+--check(\s+.*)?$/,
+
   // Python
   /^pytest(\s+.*)?$/,
   /^python\s+-m\s+(pytest|unittest)(\s+.*)?$/,
@@ -121,12 +129,92 @@ const ALLOWED_COMMAND_PATTERNS = [
   /^mypy(\s+.*)?$/,
   /^ruff(\s+(check|format))(\s+.*)?$/,
   /^black\s+--check(\s+.*)?$/,
+  /^flake8(\s+.*)?$/,
+  /^pylint(\s+.*)?$/,
+  /^bandit(\s+.*)?$/,
 
   // Rust
   /^cargo\s+(test|check|clippy|build)(\s+.*)?$/,
 
   // Go
   /^go\s+(test|vet|build)(\s+.*)?$/,
+  /^golangci-lint\s+run(\s+.*)?$/,
+
+  // Java - Maven
+  /^mvn\s+(test|verify|compile|checkstyle:check)(\s+.*)?$/,
+  /^mvnw\s+(test|verify|compile|checkstyle:check)(\s+.*)?$/,
+  /^\.\/mvnw\s+(test|verify|compile|checkstyle:check)(\s+.*)?$/,
+
+  // Java/Kotlin - Gradle
+  /^gradle\s+(test|check|build|assemble)(\s+.*)?$/,
+  /^gradlew\s+(test|check|build|assemble)(\s+.*)?$/,
+  /^\.\/gradlew\s+(test|check|build|assemble)(\s+.*)?$/,
+
+  // C# / .NET
+  /^dotnet\s+(test|build)(\s+.*)?$/,
+  /^dotnet\s+format\s+--verify-no-changes(\s+.*)?$/,
+
+  // PHP
+  /^phpunit(\s+.*)?$/,
+  /^php\s+vendor\/bin\/phpunit(\s+.*)?$/,
+  /^composer\s+(test|run\s+test)(\s+.*)?$/,
+  /^php\s+artisan\s+test(\s+.*)?$/,
+  /^phpstan\s+analyse(\s+.*)?$/,
+  /^psalm(\s+.*)?$/,
+  /^phpcs(\s+.*)?$/,
+
+  // Ruby
+  /^bundle\s+exec\s+(rspec|rake\s+test)(\s+.*)?$/,
+  /^rake\s+test(\s+.*)?$/,
+  /^rspec(\s+.*)?$/,
+  /^rubocop(\s+.*)?$/,
+  /^ruby\s+-c(\s+.*)?$/,
+
+  // Elixir
+  /^mix\s+(test|compile|format\s+--check-formatted|credo|dialyzer)(\s+.*)?$/,
+
+  // Scala
+  /^sbt\s+(test|compile|scalafmtCheck)(\s+.*)?$/,
+
+  // Swift
+  /^swift\s+(test|build)(\s+.*)?$/,
+  /^swiftlint(\s+.*)?$/,
+  /^xcodebuild\s+test(\s+.*)?$/,
+
+  // C/C++
+  /^cmake\s+--build(\s+.*)?$/,
+  /^ctest(\s+.*)?$/,
+  /^make\s+-j\d*\s*test$/,
+
+  // Haskell
+  /^stack\s+(test|build)(\s+.*)?$/,
+  /^cabal\s+(test|build)(\s+.*)?$/,
+  /^hlint(\s+.*)?$/,
+
+  // Zig
+  /^zig\s+build(\s+test)?(\s+.*)?$/,
+
+  // Dart/Flutter
+  /^dart\s+(test|analyze)(\s+.*)?$/,
+  /^flutter\s+(test|analyze)(\s+.*)?$/,
+
+  // Clojure
+  /^lein\s+(test|check)(\s+.*)?$/,
+  /^clj\s+-M:test(\s+.*)?$/,
+
+  // Perl
+  /^prove(\s+.*)?$/,
+  /^perl\s+-c(\s+.*)?$/,
+
+  // Lua
+  /^busted(\s+.*)?$/,
+  /^luacheck(\s+.*)?$/,
+
+  // Julia
+  /^julia\s+--project\s+-e\s+'.*Pkg\.test.*'$/,
+
+  // OCaml
+  /^dune\s+(test|build)(\s+.*)?$/,
 
   // Make
   /^make(\s+(test|check|lint|build))?$/,
@@ -135,6 +223,7 @@ const ALLOWED_COMMAND_PATTERNS = [
   /^eslint(\s+.*)?$/,
   /^prettier\s+--check(\s+.*)?$/,
   /^tsc(\s+--noEmit)?(\s+.*)?$/,
+  /^biome\s+(check|lint|format)(\s+.*)?$/,
 ];
 
 /**
