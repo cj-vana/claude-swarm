@@ -48,6 +48,21 @@
 - **Project Analysis** - Detects languages, frameworks, and adapts configuration
 - **Merge Mode** - Preserves existing configs by default, with optional force overwrite
 
+## How It Works
+
+The orchestrator pattern separates concerns for reliable long-running sessions:
+
+- **Orchestrator (Claude Code)**: Plans work, monitors progress, makes decisions
+- **MCP Server**: Maintains persistent state that survives context compaction
+- **Workers**: Isolated Claude Code sessions in tmux that implement individual features
+- **Protocols**: Behavioral constraints governing what workers can/cannot do
+
+This separation enables:
+- **Parallel execution**: Multiple workers implement features simultaneously
+- **State persistence**: Session state survives context compaction via the MCP server
+- **Failure recovery**: Workers can retry, rollback, or be guided when stuck
+- **Behavioral governance**: Protocols enforce constraints on worker actions
+
 ## Quick Start
 
 ### Prerequisites
@@ -121,6 +136,30 @@ Phase 6: Review
   → check_reviews - Monitor automated reviews
   → get_review_results - See findings
 ```
+
+### The `/swarm` Skill
+
+The `/swarm` skill provides guided orchestration with a complete workflow:
+
+```
+Use /swarm to build a REST API with authentication, user management, and tests
+```
+
+The skill automates:
+- **Phase 0**: Repository readiness check (runs `setup_analyze`)
+- **Phase 1**: Session setup with feature decomposition
+- **Phase 2**: Pre-work preparation (complexity analysis, context enrichment)
+- **Phase 3**: Execution (manual or auto-orchestration)
+- **Phase 4**: Monitoring loop with confidence tracking
+- **Phase 5**: Completion verification and git checkpoints
+- **Phase 6**: Post-completion reviews
+
+**Installing the skill:**
+```bash
+mkdir -p ~/.claude/skills/swarm && cp skill/SKILL.md ~/.claude/skills/swarm/
+```
+
+See `skill/SKILL.md` for the complete workflow reference.
 
 ## Protocol System
 
@@ -225,6 +264,34 @@ Real-time confidence scoring detects struggling workers:
 set_confidence_threshold(35)       # Configure alert level
 get_worker_confidence(featureId)   # Get detailed breakdown
 ```
+
+## Auto-Orchestration
+
+For fully autonomous execution, use `auto_orchestrate`:
+
+```
+auto_orchestrate(projectDir, strategy: "adaptive", maxConcurrent: 5)
+```
+
+This handles Phases 3-5 automatically:
+- Schedules workers based on dependencies
+- Monitors progress and handles failures
+- Runs verification commands
+- Marks features complete
+- Commits progress at checkpoints
+
+### Scheduling Strategies
+
+| Strategy | Behavior |
+|----------|----------|
+| `breadth-first` | Maximize parallel execution of independent features |
+| `depth-first` | Focus on unblocking dependent feature chains |
+| `adaptive` | System decides based on dependency graph (default) |
+
+### When to Use
+
+- **Auto-orchestration**: Large feature sets, hands-off execution
+- **Manual orchestration**: Fine-grained control, complex dependencies, debugging
 
 ## Post-Completion Reviews
 
@@ -413,7 +480,7 @@ The dashboard exposes a REST API for programmatic access:
 | `get_worker_confidence` | Get detailed confidence breakdown |
 | `set_confidence_threshold` | Configure alert threshold |
 
-### Feature Management (5 tools)
+### Feature Management (6 tools)
 | Tool | Description |
 |------|-------------|
 | `mark_complete` | Mark feature done/failed (auto-retry) |
@@ -421,6 +488,22 @@ The dashboard exposes a REST API for programmatic access:
 | `run_verification` | Run tests/build commands |
 | `add_feature` | Add discovered work |
 | `set_dependencies` | Define feature dependencies |
+| `configure_verification` | Set pre-completion verification commands |
+
+### Pre-Completion Verification
+
+Configure commands that workers must run before marking features complete:
+
+```
+configure_verification(projectDir, commands: ["npm test", "npx tsc --noEmit"])
+```
+
+Workers will run these commands and fix any errors before completion. Allowed commands include:
+- `npm test`, `npm run test`, `yarn test`, `pnpm test`
+- `npx tsc --noEmit`, `npx vitest`, `npx jest`
+- `pytest`, `python -m pytest`
+- `cargo test`, `cargo check`
+- `go test`, `make test`
 
 ### Session & Progress (6 tools)
 | Tool | Description |
@@ -571,6 +654,45 @@ your-project/
 - [Multi-Agent Collaboration via Evolving Orchestration](https://arxiv.org/abs/2505.19591)
 - [AFlow: Automatic Workflow Optimization](https://arxiv.org/abs/2410.10762)
 - [AgentsNet: Coordinating Multi-Agent Networks](https://arxiv.org/html/2507.08616v1)
+
+## Troubleshooting
+
+### "No active session"
+Run `orchestrator_status` to check state, or `orchestrator_init` to start fresh.
+
+### Worker seems stuck
+1. `check_worker(featureId)` to see current output
+2. `get_worker_confidence(featureId)` to check confidence score
+3. `send_worker_message(featureId, "guidance")` to provide direction
+4. If truly stuck, `mark_complete(featureId, success: false)` triggers auto-retry
+
+### Lost context after compaction
+Call `orchestrator_status(projectDir)` - the MCP server maintains all state externally.
+
+### Feature has unmet dependencies
+1. Check dependencies with `orchestrator_status`
+2. Complete dependency features first
+3. Or use `set_dependencies` to modify the chain
+
+### Protocol violations blocking work
+1. `get_violations()` to see what was violated
+2. `resolve_violation(violationId, resolution)` if false positive
+3. Adjust protocol constraints if too restrictive
+
+### Debugging tmux sessions
+```bash
+# List all worker sessions
+tmux list-sessions | grep cc-worker
+
+# Attach to a worker session
+tmux attach -t cc-worker-feature-1-abc123
+
+# Capture recent output
+tmux capture-pane -t <session-name> -p -S -100
+```
+
+### Monitor stops unexpectedly
+The monitor auto-stops after 5 consecutive errors (circuit breaker). Check MCP server logs and restart if needed.
 
 ## Limitations
 
