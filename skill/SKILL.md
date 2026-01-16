@@ -22,18 +22,34 @@ Follow these phases in order for every swarm session:
 
 ### Phase 0: Repository Readiness Check
 
-Before starting any feature work, check if the repository needs configuration:
+Before starting any feature work, ensure the repository is ready:
 
 ```
-1. ANALYZE the repository:
+1. ENSURE GITIGNORE (CRITICAL - always do this first):
+   Check if .gitignore contains swarm state files. If not, add them:
+
+   Required entries:
+   .claude/
+   claude-progress.txt
+   init.sh
+
+   Run this to add missing entries:
+   grep -q "^\.claude/" .gitignore 2>/dev/null || echo ".claude/" >> .gitignore
+   grep -q "^claude-progress.txt" .gitignore 2>/dev/null || echo "claude-progress.txt" >> .gitignore
+   grep -q "^init.sh" .gitignore 2>/dev/null || echo "init.sh" >> .gitignore
+
+   **Why:** Swarm state files must NEVER be committed. They contain session-specific
+   data, absolute paths, worker logs, and will cause merge conflicts.
+
+2. ANALYZE the repository:
    → setup_analyze(projectDir)
 
-2. IF freshness score >= 50 (missing configurations):
+3. IF freshness score >= 50 (missing configurations):
    → setup_init(projectDir)
    → Monitor: setup_status(projectDir)
    → Wait for all setup workers to complete
 
-3. IF freshness score < 50:
+4. IF freshness score < 50:
    → Proceed to Phase 1 (repo already configured)
 ```
 
@@ -222,8 +238,8 @@ FEATURE FAILED AND NEEDS ROLLBACK?
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  Phase 0: setup_analyze → IF score >= 50: setup_init             │
-│           └─ Wait for repo configuration if needed               │
+│  Phase 0: Ensure .gitignore has swarm files (.claude/, etc.)     │
+│           → setup_analyze → IF score >= 50: setup_init           │
 └─────────────────────────────────────────────────────────────────┘
                                  │
                                  ▼
