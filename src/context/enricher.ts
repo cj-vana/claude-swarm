@@ -327,37 +327,59 @@ export class ContextEnricher {
   }
 
   /**
-   * Format enriched context as a string for inclusion in prompts
+   * Format enriched context as a string for inclusion in prompts.
+   * Budget-aware: prioritizes high-value sections and drops low-priority
+   * content when approaching the budget limit. This prevents context
+   * window pollution per the blog post's recommendation.
    */
-  formatForPrompt(context: EnrichedContext): string {
-    const sections: string[] = [];
+  formatForPrompt(context: EnrichedContext, maxLength: number = 8000): string {
+    // Build prioritized sections (higher priority = included first)
+    const sections: Array<{ priority: number; content: string }> = [];
 
-    // Project info section
+    // Priority 100: Project info (always included, very small)
     if (context.projectInfo.type !== "unknown") {
-      sections.push(this.formatProjectInfo(context.projectInfo));
+      sections.push({ priority: 100, content: this.formatProjectInfo(context.projectInfo) });
     }
 
-    // Documentation section
+    // Priority 90: Documentation (high value, may be large)
     if (context.documentation.length > 0) {
-      sections.push(this.formatDocumentation(context.documentation));
+      sections.push({ priority: 90, content: this.formatDocumentation(context.documentation) });
     }
 
-    // Related files section
-    if (context.relatedFiles.length > 0) {
-      sections.push(this.formatRelatedFiles(context.relatedFiles));
-    }
-
-    // Patterns section
+    // Priority 60: Architectural patterns (moderate value)
     if (context.patterns.length > 0) {
-      sections.push(this.formatPatterns(context.patterns));
+      sections.push({ priority: 60, content: this.formatPatterns(context.patterns) });
     }
 
-    // Related features section
+    // Priority 50: Related features (small, useful for awareness)
     if (context.relatedFeatures.length > 0) {
-      sections.push(this.formatRelatedFeatures(context.relatedFeatures));
+      sections.push({ priority: 50, content: this.formatRelatedFeatures(context.relatedFeatures) });
     }
 
-    return sections.join("\n\n");
+    // Priority 30: Related files (lowest priority, often largest - drop first)
+    if (context.relatedFiles.length > 0) {
+      sections.push({ priority: 30, content: this.formatRelatedFiles(context.relatedFiles) });
+    }
+
+    // Sort by priority (highest first) and accumulate until budget exhausted
+    sections.sort((a, b) => b.priority - a.priority);
+    let totalSize = 0;
+    const included: string[] = [];
+
+    for (const section of sections) {
+      if (totalSize + section.content.length > maxLength) {
+        // Try truncating this section to fit remaining budget
+        const remaining = maxLength - totalSize;
+        if (remaining > 200) {
+          included.push(section.content.substring(0, remaining) + "\n... (truncated to fit context budget)");
+        }
+        break;
+      }
+      included.push(section.content);
+      totalSize += section.content.length;
+    }
+
+    return included.join("\n\n");
   }
 
   /**

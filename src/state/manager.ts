@@ -26,6 +26,7 @@ import {
 import { ComplexityResult } from "../utils/complexity-detector.js";
 import { PlanSubmission } from "../utils/plan-evaluator.js";
 import { ConfidenceAlert } from "../workers/confidence.js";
+import type { WorkerPlan, PlanReview, ApprovalCriteria, QualityScore } from "../workers/plan-reviewer.js";
 
 /**
  * DocumentationRef - Reference to documentation that provides context for a feature
@@ -146,6 +147,11 @@ export interface Feature {
   protocolBindings?: ProtocolBinding[]; // Protocols bound to this feature
   routing?: RoutingConfig; // Routing configuration for worker assignment
 
+  // Git worktree isolation fields
+  worktreePath?: string; // Path to the worktree directory (if using isolation)
+  worktreeBranch?: string; // Git branch for the worktree
+  isolationMode?: "none" | "worktree"; // How this feature's worker was isolated
+
   // Files modified by this feature's worker
   modifiedFiles?: string[];
 
@@ -154,6 +160,21 @@ export interface Feature {
   votingRole?: `voter-${number}`; // Which voter in the group (voter-1, voter-2, etc.)
   votingScore?: number; // Score after evaluation (0-100)
   votingWinner?: boolean; // True if this solution won the vote
+
+  // Worker plan mode fields
+  planMode?: boolean;                     // Enable plan-before-implement
+  planPhase?: "planning" | "reviewing" | "implementing";
+  workerPlan?: WorkerPlan;                // The approved plan
+  planReview?: PlanReview;                // Auto-review result
+  planAttempts?: number;                  // Re-plan counter
+  approvalCriteria?: ApprovalCriteria;    // Per-feature criteria
+  qualityScore?: QualityScore;            // Post-completion quality assessment
+
+  // Ralph Loop fields
+  ralphLoop?: boolean;                    // Using Ralph Loop execution
+  ralphIteration?: number;                // Current Ralph Loop iteration
+  ralphMaxIterations?: number;            // Max iterations configured
+  ralphProgressFile?: string;             // Path to progress file
 }
 
 export interface WorkerStatus {
@@ -233,6 +254,72 @@ export interface VerificationConfig {
   failOnError: boolean; // Whether to fail the feature if verification fails
 }
 
+/**
+ * PlanModeConfig - Global configuration for worker plan mode
+ */
+export interface PlanModeConfig {
+  enabled: boolean;               // Global toggle (default: true)
+  complexityThreshold: number;    // Min complexity score to trigger plan mode (default: 30)
+  approvalCriteria: ApprovalCriteria;
+  maxReplanAttempts: number;      // Max times to re-plan before fallback (default: 2)
+}
+
+/**
+ * RalphLoopConfig - Global configuration for Ralph Loop execution
+ */
+export interface RalphLoopConfig {
+  enabled: boolean;               // Global toggle (default: false)
+  maxIterations: number;          // Max iterations per feature (default: 50)
+  maxDurationMinutes: number;     // Max duration per feature (default: 480 = 8 hours)
+  stopOnComplete: boolean;        // Stop when .done file detected (default: true)
+  verifyBeforeStop: boolean;      // Run verification before stopping (default: true)
+}
+
+/**
+ * Checkpoint - Periodic snapshot of session state for crash recovery
+ */
+export interface Checkpoint {
+  id: string;                     // Timestamp-based
+  reason: "periodic" | "feature_complete" | "crash_recovery" | "manual" | "shutdown";
+  timestamp: string;
+  state: OrchestratorState;       // Full state snapshot
+  activeWorkers: WorkerCheckpoint[];
+  gitHead: string;                // Git HEAD at checkpoint time
+}
+
+/**
+ * WorkerCheckpoint - Snapshot of an active worker's state
+ */
+export interface WorkerCheckpoint {
+  featureId: string;
+  sessionName: string;
+  tmuxAlive: boolean;
+  lastProgress: string;           // Last line from progress file
+  iteration: number;              // Ralph Loop iteration count
+  phase: "planning" | "implementing";
+}
+
+/**
+ * Heartbeat - Orchestrator liveness detection
+ */
+export interface Heartbeat {
+  pid: number;
+  lastBeat: string;
+  sessionId: string;
+  autoOrchestrateRunning: boolean;
+}
+
+/**
+ * FailurePattern - Learned patterns from completed features
+ */
+export interface FailurePattern {
+  featureType: string;
+  commonErrors: string[];
+  successfulApproaches: string[];
+  iterations: number;
+  planWasUseful: boolean;
+}
+
 export interface OrchestratorState {
   projectDir: string;
   taskDescription: string;
@@ -252,6 +339,12 @@ export interface OrchestratorState {
   // Confidence monitoring
   confidenceConfig?: ConfidenceConfig;
   confidenceAlerts?: ConfidenceAlert[];
+
+  // Plan mode configuration
+  planModeConfig?: PlanModeConfig;
+
+  // Ralph Loop configuration
+  ralphLoopConfig?: RalphLoopConfig;
 
   // Post-completion reviews
   reviewConfig?: ReviewConfig;
@@ -564,5 +657,320 @@ echo "   Use 'orchestrator_status' to check current progress"
       this.save(state);
       this.writeProgressFile();
     }
+  }
+
+  // ============================================================================
+  // Checkpointing (Phase 3)
+  // ============================================================================
+
+  private get checkpointDir(): string {
+    return path.join(this.projectDir, ".claude", "orchestrator", "checkpoints");
+  }
+
+  private get heartbeatFile(): string {
+    return path.join(this.projectDir, ".claude", "orchestrator", "heartbeat.json");
+  }
+
+  private get learningsFile(): string {
+    return path.join(this.projectDir, ".claude", "orchestrator", "learnings.json");
+  }
+
+  /**
+   * Create a checkpoint of the current session state
+   */
+  async checkpoint(
+    reason: Checkpoint["reason"],
+    activeWorkers: WorkerCheckpoint[] = []
+  ): Promise<string> {
+    const state = this.load();
+    if (!state) throw new Error("No state to checkpoint");
+
+    // Get git HEAD
+    let gitHead = "unknown";
+    try {
+      const { execFileSync } = await import("child_process");
+      gitHead = execFileSync("git", ["rev-parse", "HEAD"], {
+        cwd: this.projectDir,
+        encoding: "utf-8",
+      }).trim();
+    } catch {
+      // Not a git repo or git not available
+    }
+
+    const id = new Date().toISOString().replace(/[:.]/g, "-");
+    const checkpoint: Checkpoint = {
+      id,
+      reason,
+      timestamp: new Date().toISOString(),
+      state,
+      activeWorkers,
+      gitHead,
+    };
+
+    // Ensure checkpoint directory exists
+    if (!fs.existsSync(this.checkpointDir)) {
+      fs.mkdirSync(this.checkpointDir, { recursive: true });
+    }
+
+    // Write checkpoint atomically
+    const checkpointFile = path.join(this.checkpointDir, `${id}.json`);
+    const tempFile = `${checkpointFile}.tmp.${Date.now()}`;
+    try {
+      fs.writeFileSync(tempFile, JSON.stringify(checkpoint, null, 2));
+      fs.renameSync(tempFile, checkpointFile);
+    } catch (error) {
+      try { fs.unlinkSync(tempFile); } catch { /* ignore */ }
+      throw error;
+    }
+
+    // Rotate: keep last 10 checkpoints
+    this.rotateCheckpoints(10);
+
+    return id;
+  }
+
+  /**
+   * Load the most recent checkpoint
+   */
+  loadLatestCheckpoint(): Checkpoint | null {
+    if (!fs.existsSync(this.checkpointDir)) return null;
+
+    const files = fs.readdirSync(this.checkpointDir)
+      .filter(f => f.endsWith(".json"))
+      .sort()
+      .reverse();
+
+    if (files.length === 0) return null;
+
+    try {
+      const content = fs.readFileSync(
+        path.join(this.checkpointDir, files[0]),
+        "utf-8"
+      );
+      return JSON.parse(content) as Checkpoint;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Load a specific checkpoint by ID
+   */
+  loadCheckpoint(id: string): Checkpoint | null {
+    const file = path.join(this.checkpointDir, `${id}.json`);
+    if (!fs.existsSync(file)) return null;
+
+    try {
+      const content = fs.readFileSync(file, "utf-8");
+      return JSON.parse(content) as Checkpoint;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * List available checkpoints
+   */
+  listCheckpoints(): Array<{ id: string; reason: string; timestamp: string }> {
+    if (!fs.existsSync(this.checkpointDir)) return [];
+
+    return fs.readdirSync(this.checkpointDir)
+      .filter(f => f.endsWith(".json"))
+      .sort()
+      .reverse()
+      .map(f => {
+        try {
+          const content = fs.readFileSync(
+            path.join(this.checkpointDir, f),
+            "utf-8"
+          );
+          const cp = JSON.parse(content) as Checkpoint;
+          return { id: cp.id, reason: cp.reason, timestamp: cp.timestamp };
+        } catch {
+          return null;
+        }
+      })
+      .filter((x): x is NonNullable<typeof x> => x !== null);
+  }
+
+  /**
+   * Rotate checkpoints, keeping only the most recent N
+   */
+  private rotateCheckpoints(keep: number): void {
+    if (!fs.existsSync(this.checkpointDir)) return;
+
+    const files = fs.readdirSync(this.checkpointDir)
+      .filter(f => f.endsWith(".json"))
+      .sort();
+
+    if (files.length <= keep) return;
+
+    const toDelete = files.slice(0, files.length - keep);
+    for (const file of toDelete) {
+      try {
+        fs.unlinkSync(path.join(this.checkpointDir, file));
+      } catch {
+        // Ignore deletion errors
+      }
+    }
+  }
+
+  // ============================================================================
+  // Heartbeat (Phase 3)
+  // ============================================================================
+
+  /**
+   * Write a heartbeat file to indicate the orchestrator is alive
+   */
+  writeHeartbeat(sessionId: string, autoOrchestrateRunning: boolean): void {
+    const heartbeat: Heartbeat = {
+      pid: process.pid,
+      lastBeat: new Date().toISOString(),
+      sessionId,
+      autoOrchestrateRunning,
+    };
+
+    const tempFile = `${this.heartbeatFile}.tmp.${Date.now()}`;
+    try {
+      fs.writeFileSync(tempFile, JSON.stringify(heartbeat, null, 2));
+      fs.renameSync(tempFile, this.heartbeatFile);
+    } catch (error) {
+      try { fs.unlinkSync(tempFile); } catch { /* ignore */ }
+      // Non-fatal - heartbeat is best-effort
+    }
+  }
+
+  /**
+   * Read the current heartbeat
+   */
+  readHeartbeat(): Heartbeat | null {
+    if (!fs.existsSync(this.heartbeatFile)) return null;
+
+    try {
+      const content = fs.readFileSync(this.heartbeatFile, "utf-8");
+      return JSON.parse(content) as Heartbeat;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Check if a previous orchestrator session crashed
+   * Returns true if heartbeat is stale (> 2 minutes) and PID is dead
+   */
+  detectCrash(): { crashed: boolean; heartbeat: Heartbeat | null; checkpoint: Checkpoint | null } {
+    const heartbeat = this.readHeartbeat();
+    const checkpoint = this.loadLatestCheckpoint();
+
+    if (!heartbeat) {
+      // No heartbeat file - check if there's a non-completed state with checkpoint
+      const state = this.load();
+      if (state && checkpoint && state.status !== "completed" && state.status !== "completed_with_failures") {
+        return { crashed: true, heartbeat: null, checkpoint };
+      }
+      return { crashed: false, heartbeat: null, checkpoint: null };
+    }
+
+    // Check if heartbeat is stale (> 2 minutes old)
+    const lastBeat = new Date(heartbeat.lastBeat);
+    const staleMs = 2 * 60 * 1000;
+    const isStale = (Date.now() - lastBeat.getTime()) > staleMs;
+
+    if (!isStale) {
+      return { crashed: false, heartbeat, checkpoint: null };
+    }
+
+    // Heartbeat is stale - check if PID is still alive
+    let pidAlive = false;
+    try {
+      process.kill(heartbeat.pid, 0); // Signal 0 = just check existence
+      pidAlive = true;
+    } catch {
+      pidAlive = false;
+    }
+
+    if (pidAlive) {
+      return { crashed: false, heartbeat, checkpoint: null };
+    }
+
+    // Stale heartbeat + dead PID = crash
+    return { crashed: true, heartbeat, checkpoint };
+  }
+
+  /**
+   * Remove heartbeat file (on clean shutdown)
+   */
+  removeHeartbeat(): void {
+    if (fs.existsSync(this.heartbeatFile)) {
+      try {
+        fs.unlinkSync(this.heartbeatFile);
+      } catch {
+        // Ignore
+      }
+    }
+  }
+
+  // ============================================================================
+  // Failure Pattern Learning (Phase 4)
+  // ============================================================================
+
+  /**
+   * Record a failure pattern from a completed feature
+   */
+  recordLearning(pattern: FailurePattern): void {
+    const patterns = this.loadLearnings();
+    patterns.push(pattern);
+
+    // Keep last 100 patterns
+    const trimmed = patterns.slice(-100);
+
+    const tempFile = `${this.learningsFile}.tmp.${Date.now()}`;
+    try {
+      fs.writeFileSync(tempFile, JSON.stringify({ patterns: trimmed }, null, 2));
+      fs.renameSync(tempFile, this.learningsFile);
+    } catch (error) {
+      try { fs.unlinkSync(tempFile); } catch { /* ignore */ }
+    }
+  }
+
+  /**
+   * Load failure patterns
+   */
+  loadLearnings(): FailurePattern[] {
+    if (!fs.existsSync(this.learningsFile)) return [];
+
+    try {
+      const content = fs.readFileSync(this.learningsFile, "utf-8");
+      const data = JSON.parse(content);
+      return data.patterns || [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Find relevant learnings for a feature description
+   */
+  findRelevantLearnings(description: string, maxResults: number = 3): FailurePattern[] {
+    const patterns = this.loadLearnings();
+    if (patterns.length === 0) return [];
+
+    // Simple keyword matching - find patterns with overlapping terms
+    const descWords = new Set(
+      description.toLowerCase().split(/\W+/).filter(w => w.length > 3)
+    );
+
+    return patterns
+      .map(p => {
+        const typeWords = new Set(
+          p.featureType.toLowerCase().split(/\W+/).filter(w => w.length > 3)
+        );
+        const overlap = [...descWords].filter(w => typeWords.has(w)).length;
+        return { pattern: p, score: overlap };
+      })
+      .filter(x => x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, maxResults)
+      .map(x => x.pattern);
   }
 }

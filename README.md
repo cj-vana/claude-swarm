@@ -22,11 +22,21 @@
 ### Worker Orchestration
 - **Persistent State** - Session state survives context compaction via MCP server
 - **Parallel Workers** - Run multiple Claude Code workers simultaneously via tmux
+- **Git Worktree Isolation** - Workers run in isolated git worktrees for safe parallel modification
+- **Worker Plan Mode** - Workers analyze codebases and produce plans before implementing (auto-approved)
 - **Competitive Planning** - Complex features get two competing implementation plans
 - **Confidence Monitoring** - Multi-signal scoring detects struggling workers
+- **Enforced Verification** - Test-as-supervisor pattern with configurable verification commands
 - **Auto-retry** - Failed features automatically retry with configurable limits
 - **Feature Dependencies** - Define execution order between features
+- **File-Based Task Locking** - Atomic mutual exclusion prevents workers from conflicting
 - **Post-Completion Reviews** - Automated code and architecture reviews with actionable findings
+
+### Long-Running Autonomy
+- **Ralph Loop** - Fresh Claude context per iteration eliminates context rot for long sessions
+- **Days-Long Sessions** - Supports hours/days of autonomous execution with checkpointing
+- **Crash Recovery** - Automatic session resumption after crashes or machine restarts
+- **Failure Pattern Learning** - Records what works/fails for future worker prompts
 
 ### Protocol-Based Governance
 - **Behavioral Protocols** - Define constraints on what workers can/cannot do
@@ -54,8 +64,36 @@ The orchestrator pattern separates concerns for reliable long-running sessions:
 
 - **Orchestrator (Claude Code)**: Plans work, monitors progress, makes decisions
 - **MCP Server**: Maintains persistent state that survives context compaction
-- **Workers**: Isolated Claude Code sessions in tmux that implement individual features
+- **Workers**: Isolated Claude Code sessions in git worktrees via tmux that implement individual features
 - **Protocols**: Behavioral constraints governing what workers can/cannot do
+- **Ralph Loop**: External bash loop that launches fresh Claude sessions per iteration, with state persisted to the filesystem (progress files, git history)
+
+### Worker Lifecycle
+
+Workers follow a two-phase lifecycle when plan mode is enabled (complexity >= 30):
+
+1. **Plan Phase** - Worker runs with read-only tools (Read, Glob, Grep, Write), analyzes the codebase, and produces a structured plan
+2. **Auto-Review** - Orchestrator scores the plan on test strategy, risk assessment, file specificity, and step count
+3. **Implement Phase** - Worker runs with full tools, following the approved plan step by step
+
+### Ralph Loop (Long-Running Autonomy)
+
+For long-running features, the Ralph Loop replaces single long-lived sessions:
+
+1. Each iteration launches a **fresh Claude session** (no context rot)
+2. State persists via **filesystem**: progress.md, git history, .done files
+3. Prompt **re-reads current state** each iteration (self-reloading context)
+4. Configurable stopping conditions: completion marker, time limit, max iterations
+5. Git diff injected into prompt so worker sees what changed
+
+### Session Resilience
+
+Sessions survive crashes and machine restarts:
+
+- **Checkpointing** - State snapshots every ~15 minutes while workers are running
+- **Heartbeat Detection** - PID-based liveness detection identifies stale sessions
+- **Crash Recovery** - `resume_session` detects crashes, loads checkpoints, restarts dead workers
+- **Graceful Shutdown** - `shutdown_session` creates checkpoint and stops workers cleanly
 
 This separation enables:
 - **Parallel execution**: Multiple workers implement features simultaneously
@@ -457,15 +495,18 @@ The dashboard exposes a REST API for programmatic access:
 | `orchestrator_status` | Get current state (use after compaction) |
 | `orchestrator_reset` | Clear state and kill all workers |
 
-### Worker Management (6 tools)
+### Worker Management (9 tools)
 | Tool | Description |
 |------|-------------|
 | `start_worker` | Launch worker for a feature |
 | `start_parallel_workers` | Launch multiple workers simultaneously |
+| `start_ralph_loop` | Launch worker with Ralph Loop (fresh context per iteration) |
 | `validate_workers` | Pre-flight validation before parallel execution |
 | `check_worker` | Get worker output (supports heartbeat mode) |
 | `check_all_workers` | Check all active workers at once |
 | `send_worker_message` | Send instructions to running worker |
+| `configure_plan_mode` | Enable/configure worker plan-before-implement mode |
+| `configure_ralph_loop` | Enable/configure Ralph Loop execution defaults |
 
 ### Competitive Planning (3 tools)
 | Tool | Description |
@@ -505,13 +546,14 @@ Workers will run these commands and fix any errors before completion. Allowed co
 - `cargo test`, `cargo check`
 - `go test`, `make test`
 
-### Session & Progress (6 tools)
+### Session & Progress (7 tools)
 | Tool | Description |
 |------|-------------|
 | `get_progress_log` | View history (paginated) |
 | `get_session_stats` | Success rates and timing |
 | `pause_session` | Pause and stop all workers |
-| `resume_session` | Resume paused session |
+| `resume_session` | Resume paused session (supports crash recovery) |
+| `shutdown_session` | Graceful shutdown with checkpoint |
 | `commit_progress` | Create git checkpoint |
 | `auto_orchestrate` | Hands-free orchestration until completion |
 
@@ -593,6 +635,13 @@ your-project/
 │   │   ├── audit.json          # Audit log
 │   │   └── proposals/          # Pending proposals
 │   ├── sync/                   # Cross-instance sync
+│   ├── checkpoints/            # Session checkpoints for crash recovery
+│   │   └── *.json              # Timestamped state snapshots
+│   ├── heartbeat.json          # Orchestrator liveness detection
+│   ├── learnings.json          # Failure pattern learning
+│   ├── locks/                  # File-based mutual exclusion
+│   │   └── *.lock              # Per-file lock files
+│   ├── worktrees/              # Git worktree directories
 │   └── workers/
 │       ├── *.prompt            # Worker prompts
 │       ├── *.log               # Worker output logs
@@ -600,6 +649,9 @@ your-project/
 │       ├── *.status            # Worker status
 │       ├── *.plan.json         # Competitive plans
 │       ├── *.confidence        # Self-reported confidence
+│       ├── *.worker-plan.json  # Worker plan-phase output
+│       ├── *.plan-done         # Plan phase completion markers
+│       ├── *.progress.md       # Ralph Loop progress files
 │       ├── code-review.findings.json        # Code review results
 │       └── architecture-review.findings.json # Architecture review results
 ├── claude-progress.txt         # Human-readable log
@@ -650,6 +702,8 @@ your-project/
 ## Inspiration
 
 - [Anthropic's "Effective harnesses for long-running agents"](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
+- [Ralph Loop: A Continuous Iteration Paradigm for AI Agents](https://www.alibabacloud.com/blog/from-react-to-ralph-loop-a-continuous-iteration-paradigm-for-ai-agents_602799)
+- [Claude Code Agent Teams](https://code.claude.com/docs/en/agent-teams)
 - [MAKER: "Solving a Million-Step LLM Task with Zero Errors"](https://arxiv.org/abs/2511.09030)
 - [Multi-Agent Collaboration via Evolving Orchestration](https://arxiv.org/abs/2505.19591)
 - [AFlow: Automatic Workflow Optimization](https://arxiv.org/abs/2410.10762)
@@ -690,6 +744,15 @@ tmux attach -t cc-worker-feature-1-abc123
 # Capture recent output
 tmux capture-pane -t <session-name> -p -S -100
 ```
+
+### Session crashed, how to recover
+Use `resume_session(projectDir)` - it automatically detects crashes via stale heartbeat, loads the latest checkpoint, and restarts dead workers. Set `restartDeadWorkers: true` (default) to auto-restart Ralph Loop workers that were running.
+
+### Worker keeps failing verification
+Check the Ralph Loop progress file (`.claude/orchestrator/workers/{featureId}.progress.md`) for error patterns across iterations. The progress file records issues encountered in each iteration, helping identify systematic problems.
+
+### Plan mode is too slow
+Lower the complexity threshold (default: 30) via `configure_plan_mode(projectDir, { complexityThreshold: 50 })` so only higher-complexity features trigger planning. Or disable per-feature by setting `planMode: false` on the feature.
 
 ### Monitor stops unexpectedly
 The monitor auto-stops after 5 consecutive errors (circuit breaker). Check MCP server logs and restart if needed.

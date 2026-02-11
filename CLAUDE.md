@@ -44,6 +44,16 @@ This is an MCP (Model Context Protocol) server that orchestrates parallel Claude
 
 **src/workers/review-manager.ts** - Orchestrates post-completion code and architecture reviews. Parses worker logs to identify modified files, builds review prompts with session context, and aggregates findings into structured JSON. Review workers have read-only tool access (no Bash). Notifies orchestrator when reviews complete via status file updates.
 
+**src/workers/worktree-manager.ts** - Git worktree creation, merge-back, and cleanup. Each worker gets its own worktree directory for isolation from main working tree.
+
+**src/workers/verification-runner.ts** - Verification command execution and validation. Runs pre-completion test/build commands and validates results.
+
+**src/workers/lock-manager.ts** - Atomic file-based mutual exclusion. Prevents multiple workers from modifying the same files simultaneously.
+
+**src/workers/plan-reviewer.ts** - Auto-approval engine for worker plans. Scores plans on test strategy, risk assessment, file specificity, and step count. Threshold-based approval (score >= 50). Also provides post-completion quality assessment.
+
+**src/workers/ralph-loop.ts** - Ralph Loop script generation and configuration. Builds bash wrapper scripts that run fresh Claude sessions per iteration with filesystem-based state persistence (progress files, git diff).
+
 ### Protocol Governance System
 
 The protocol system enables behavioral constraints on workers. Located in `src/protocols/`:
@@ -135,12 +145,17 @@ Located in `src/setup/`:
 
 1. **Persistent State Outside Context** - State survives Claude's context compaction via the MCP server
 2. **Worker Isolation** - Each worker runs in its own tmux session with controlled tool access (`Bash,Read,Write,Edit,Glob,Grep`)
-3. **Atomic File Operations** - State and progress files use write-to-temp-then-rename pattern
-4. **Command Allowlist** - Only safe verification commands (npm test, pytest, etc.) can be executed
-5. **File-Based Prompt Passing** - Worker prompts written to `.prompt` files, not shell strings
-6. **Fail-Closed Enforcement** - Unknown constraint types block by default in protocol validation
-7. **Immutable Base Constraints** - Security boundaries frozen at module load, cannot be overridden
-8. **SSE for Real-time Updates** - Dashboard uses Server-Sent Events for live worker monitoring
+3. **Git Worktree Isolation** - Each worker gets its own git worktree directory for safe parallel modification
+4. **Atomic File Operations** - State and progress files use write-to-temp-then-rename pattern
+5. **Command Allowlist** - Only safe verification commands (npm test, pytest, etc.) can be executed
+6. **File-Based Prompt Passing** - Worker prompts written to `.prompt` files, not shell strings
+7. **Fail-Closed Enforcement** - Unknown constraint types block by default in protocol validation
+8. **Immutable Base Constraints** - Security boundaries frozen at module load, cannot be overridden
+9. **SSE for Real-time Updates** - Dashboard uses Server-Sent Events for live worker monitoring
+10. **Ralph Loop** - External bash loop with fresh Claude context per iteration. Eliminates context rot for long-running tasks. State persists via progress files and git history.
+11. **Plan-Before-Implement** - Two-phase worker lifecycle: read-only analysis phase produces a plan, auto-reviewed and approved before implementation phase begins
+12. **Checkpoint-Based Recovery** - Periodic state snapshots enable crash resilience. Heartbeat detection identifies stale sessions for automatic recovery.
+13. **Filesystem as Memory** - Progress files and git history replace conversation context, enabling self-reloading state across fresh sessions
 
 ### State Files Created Per Project
 
@@ -155,6 +170,13 @@ Located in `src/setup/`:
 │   ├── audit.json                # Protocol operation audit log
 │   └── proposals/                # Pending LLM-generated proposals
 ├── sync/                         # Cross-instance protocol sync
+├── checkpoints/                  # Session checkpoints for crash recovery
+│   └── *.json                   # Timestamped state snapshots (last 10 kept)
+├── heartbeat.json               # Orchestrator liveness detection
+├── learnings.json               # Failure pattern learning across features
+├── locks/                       # File-based mutual exclusion locks
+│   └── *.lock                   # Per-file lock files
+├── worktrees/                   # Git worktree directories for worker isolation
 └── workers/
     ├── *.prompt                  # Worker prompts (mode 0600)
     ├── *.log                     # Worker output logs
@@ -162,6 +184,10 @@ Located in `src/setup/`:
     ├── *.status                  # Worker status JSON
     ├── *.plan.json               # Competitive planning results
     ├── *.confidence              # Self-reported confidence files
+    ├── *.worker-plan.json        # Worker plan-phase output
+    ├── *.plan-done               # Plan phase completion markers
+    ├── *.progress.md             # Ralph Loop progress files
+    ├── *.queue.json              # Continuous worker queues
     ├── code-review.findings.json # Code review results
     └── architecture-review.findings.json # Architecture review results
 

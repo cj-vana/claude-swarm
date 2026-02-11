@@ -82,7 +82,12 @@ src/
 │   ├── manager.ts        # tmux worker management
 │   ├── confidence.ts     # Worker confidence scoring
 │   ├── review-manager.ts # Post-completion reviews
-│   └── enforcement-integration.ts
+│   ├── enforcement-integration.ts
+│   ├── worktree-manager.ts      # Git worktree isolation
+│   ├── verification-runner.ts   # Verification command execution
+│   ├── lock-manager.ts          # File-based mutual exclusion
+│   ├── plan-reviewer.ts         # Worker plan auto-approval
+│   └── ralph-loop.ts            # Ralph Loop script generation
 ├── protocols/
 │   ├── schema.ts         # Zod schemas for protocols
 │   ├── registry.ts       # Protocol storage

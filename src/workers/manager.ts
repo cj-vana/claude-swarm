@@ -27,12 +27,22 @@ import {
   ReviewFindingsSchema,
   StructuredPlanSchema,
 } from "../utils/security.js";
+import { buildStructuredPrompt } from "../utils/prompt-templates.js";
 import type { ReviewFindings } from "../state/manager.js";
 import {
   getWorkerConfidence,
   AggregatedConfidence,
 } from "./confidence.js";
 import type { EnforcementIntegration, PreSpawnValidationResult, MonitoringResult } from "./enforcement-integration.js";
+import type { ContextEnricher, EnrichedContext } from "../context/enricher.js";
+import { WorktreeManager, type WorktreeInfo, type MergeResult } from "./worktree-manager.js";
+import { TaskLockManager } from "./lock-manager.js";
+import { PlanReviewer, DEFAULT_APPROVAL_CRITERIA } from "./plan-reviewer.js";
+import type { WorkerPlan, ApprovalCriteria, PlanReview } from "./plan-reviewer.js";
+import { buildRalphLoopScript, parseProgressFile, DEFAULT_RALPH_OPTIONS } from "./ralph-loop.js";
+import type { RalphLoopOptions } from "./ralph-loop.js";
+import { analyzeComplexity } from "../utils/complexity-detector.js";
+import type { PlanModeConfig, RalphLoopConfig } from "../state/manager.js";
 
 // Re-export enforcement integration types and factory for convenience
 export type { EnforcementIntegration, PreSpawnValidationResult, MonitoringResult } from "./enforcement-integration.js";
@@ -127,6 +137,12 @@ export class WorkerManager {
   private lastKnownStatus: Map<string, string> = new Map();
   // Optional enforcement integration for protocol governance
   private enforcement: EnforcementIntegration | null = null;
+  // Optional context enricher for auto-enriching worker prompts
+  private enricher: ContextEnricher | null = null;
+  // Worktree manager for git-based worker isolation
+  private worktreeManager: WorktreeManager;
+  // Lock manager for file-based mutual exclusion
+  private lockManager: TaskLockManager;
   // Monitor race condition prevention
   private monitorRunning = false;
   private monitorErrorCount = 0;
@@ -135,6 +151,8 @@ export class WorkerManager {
   constructor(projectDir: string, stateManager: StateManager) {
     this.projectDir = projectDir;
     this.stateManager = stateManager;
+    this.worktreeManager = new WorktreeManager(projectDir);
+    this.lockManager = new TaskLockManager(projectDir);
 
     // Directory for worker status files
     this.workerDir = path.join(
@@ -161,6 +179,28 @@ export class WorkerManager {
    */
   getEnforcement(): EnforcementIntegration | null {
     return this.enforcement;
+  }
+
+  /**
+   * Set the context enricher for auto-enriching worker prompts
+   * When set, workers automatically receive enriched context (documentation, related files, patterns)
+   */
+  setEnricher(enricher: ContextEnricher): void {
+    this.enricher = enricher;
+  }
+
+  /**
+   * Get the worktree manager for external worktree operations (e.g., merge-back in mark_complete)
+   */
+  getWorktreeManager(): WorktreeManager {
+    return this.worktreeManager;
+  }
+
+  /**
+   * Get the lock manager for external lock operations (e.g., cleanup in orchestrator_reset)
+   */
+  getLockManager(): TaskLockManager {
+    return this.lockManager;
   }
 
   /**
@@ -219,22 +259,46 @@ export class WorkerManager {
 
   /**
    * Build the prompt for a worker
+   * Auto-enriches with context if enricher is available
    */
-  private buildWorkerPrompt(feature: Feature, customPrompt?: string): string {
+  private async buildWorkerPrompt(feature: Feature, customPrompt?: string): Promise<string> {
     const state = this.stateManager.load();
     const taskContext = state?.taskDescription || "";
     const projectContext = this.readProjectContext();
 
+    // Auto-enrich context if enricher is available and feature hasn't been pre-enriched
+    let enrichedSection = "";
+    if (feature.context?.prepared && feature.context.prepared.length > 0) {
+      // Use pre-computed context from enrich_feature tool
+      enrichedSection = "\n## Enriched Context\n";
+      for (const ctx of feature.context.prepared) {
+        enrichedSection += `### ${ctx.key}\n${ctx.content}\n\n`;
+      }
+    } else if (this.enricher) {
+      try {
+        const allFeatures = state?.features || [];
+        const enriched = await this.enricher.enrichFeature(feature, allFeatures);
+        const formatted = this.enricher.formatForPrompt(enriched);
+        if (formatted.trim()) {
+          enrichedSection = `\n## Enriched Context\n${formatted}\n`;
+        }
+      } catch {
+        // Non-fatal - proceed without enrichment
+      }
+    }
+
+    // Use structured prompt template for the task section (includes success criteria, validation, retry guidance)
+    const structuredTask = buildStructuredPrompt(feature, customPrompt || undefined);
+
     // Build a focused prompt for the worker
     let prompt = `You are a worker agent focused on implementing a single feature.
 
-## Your Task
-${feature.description}
+${structuredTask}
 
 ## Orchestration Context
 ${taskContext}
 ${projectContext}
-
+${enrichedSection}
 ## Instructions
 1. Focus ONLY on implementing this specific feature
 2. Make small, incremental changes
@@ -245,7 +309,10 @@ ${projectContext}
      * Example: "feat(auth): add user authentication system"
      * Add footer: "🤖 Committed by claude-swarm worker ${feature.id}"${state?.verificationConfig?.commands?.length ? `
    - Run the following verification commands and ensure they pass:
-${state.verificationConfig.commands.map((cmd) => `     * \`${cmd}\``).join("\n")}${state.verificationConfig.failOnError ? "\n     * If any verification command fails, fix the issue before proceeding" : ""}` : ""}
+${state.verificationConfig.commands.map((cmd) => `     * \`${cmd}\``).join("\n")}${state.verificationConfig.failOnError ? `
+   - ⚠️ VERIFICATION IS ENFORCED: The orchestrator will automatically run these commands after you complete.
+     If any fail, your work will be REJECTED and you will be restarted with the failure output.
+     Ensure all verification passes BEFORE writing the .done file.` : ""}` : ""}
    - Create a file at: .claude/orchestrator/workers/${feature.id}.done
      with a brief summary of what you implemented
 
@@ -254,7 +321,21 @@ ${state.verificationConfig.commands.map((cmd) => `     * \`${cmd}\``).join("\n")
 - If you encounter a blocker, document it in the .done file and stop
 - Keep changes minimal and focused
 - Always commit using conventional commit format with the worker attribution footer
-- The .claude/ directory is already gitignored - don't worry about it
+- The .claude/ directory is already gitignored - don't worry about it${feature.isolationMode === "worktree" ? `
+
+## Git Worktree Isolation
+You are working in an isolated git worktree on branch: ${feature.worktreeBranch}
+- Commit your changes to THIS branch (it's already checked out)
+- The orchestrator will merge your branch back after completion
+- Do NOT push, merge, or switch branches yourself` : ""}
+
+## Output Management
+- Redirect verbose output to files instead of printing to terminal:
+  * Test output: \`cmd 2>&1 > .claude/orchestrator/workers/${feature.id}.test-output.txt\`
+  * Build output: \`cmd 2>&1 > .claude/orchestrator/workers/${feature.id}.build-output.txt\`
+- Use --fast or --ci flags for test runners when available
+- Summarize findings in the .done file rather than printing everything to stdout
+- AVOID printing entire file contents to the terminal - use targeted reads instead
 
 ## Commit Format Example
 \`\`\`bash
@@ -264,8 +345,6 @@ git add src/path/to/file1.ts src/path/to/file2.ts
 # Commit with subject and attribution footer
 git commit -m "feat(feature-name): implement the feature" -m "🤖 Committed by claude-swarm worker ${feature.id}"
 \`\`\`
-
-${customPrompt ? `\n## Additional Context\n${customPrompt}` : ""}
 
 Begin implementing the feature now.`;
 
@@ -543,14 +622,39 @@ echo 'PLANNER_EXITED' >> ${shellQuote(logFile)}
     }
 
     const sessionName = this.generateSessionName(feature.id);
-    const prompt = this.buildWorkerPrompt(feature, customPrompt);
 
-    // Create snapshot branch for rollback capability
-    const snapshotResult = await this.createSnapshotBranch(feature.id);
-    // Note: We don't fail if snapshot creation fails - just log it
-    if (!snapshotResult.success) {
-      console.log(`Note: Could not create snapshot branch for ${feature.id}: ${snapshotResult.error}`);
+    // Determine isolation level: worktree (default) or none (legacy shared directory)
+    const isolationLevel = feature.routing?.isolationLevel === "none" ? "none" : "worktree";
+    let workingDir = this.projectDir;
+    let worktreeInfo: WorktreeInfo | null = null;
+
+    if (isolationLevel === "worktree") {
+      // Try to create a worktree for isolated execution
+      const worktreeAvailable = await this.worktreeManager.isAvailable();
+      if (worktreeAvailable) {
+        try {
+          worktreeInfo = await this.worktreeManager.createWorktree(feature.id);
+          workingDir = worktreeInfo.worktreePath;
+          feature.worktreePath = worktreeInfo.worktreePath;
+          feature.worktreeBranch = worktreeInfo.branch;
+          feature.isolationMode = "worktree";
+        } catch (error) {
+          // Fall back to shared directory mode
+          console.log(`Note: Could not create worktree for ${feature.id}, falling back to shared directory: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
     }
+
+    // If not using worktree, create snapshot branch for legacy rollback
+    if (!worktreeInfo) {
+      feature.isolationMode = "none";
+      const snapshotResult = await this.createSnapshotBranch(feature.id);
+      if (!snapshotResult.success) {
+        console.log(`Note: Could not create snapshot branch for ${feature.id}: ${snapshotResult.error}`);
+      }
+    }
+
+    const prompt = await this.buildWorkerPrompt(feature, customPrompt);
 
     // Check if tmux is available
     try {
@@ -576,7 +680,7 @@ echo 'PLANNER_EXITED' >> ${shellQuote(logFile)}
       const workerFlags = getWorkerFlags();
       const scriptContent = `#!/bin/bash
 set -e
-cd ${shellQuote(this.projectDir)}
+cd ${shellQuote(workingDir)}
 PROMPT=$(cat ${shellQuote(promptFile)})
 # Prefer claude-code for Max plan compatibility (uses session auth, not API credits)
 # Falls back to claude (API mode) if claude-code is unavailable
@@ -598,7 +702,7 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
         "-s",
         sessionName,
         "-c",
-        this.projectDir,
+        workingDir,
         "bash",
         wrapperScript,
       ]);
@@ -631,6 +735,684 @@ echo 'WORKER_EXITED' >> ${shellQuote(logFile)}
         error: sanitizeOutput(error.message),
       };
     }
+  }
+
+  /**
+   * Start a continuous worker that processes multiple features sequentially.
+   * The worker runs in a loop, picking up new tasks from a queue file.
+   * Inspired by the infinite while-loop pattern from "Building a C compiler with parallel Claudes".
+   */
+  async startContinuousWorker(
+    initialFeature: Feature,
+    workerId: string,
+    options?: { maxTasks?: number }
+  ): Promise<StartWorkerResult> {
+    // Validate inputs
+    try {
+      validateFeatureId(initialFeature.id);
+    } catch (error: any) {
+      return { success: false, error: `Invalid feature ID: ${error.message}` };
+    }
+
+    const maxTasks = options?.maxTasks ?? 10;
+    const sessionName = `cc-continuous-${workerId}-${Date.now().toString(36)}`;
+
+    // Create the queue file
+    const queueFile = path.join(this.workerDir, `${workerId}.queue.json`);
+    const queue = {
+      workerId,
+      tasks: [{ featureId: initialFeature.id }],
+      completedTasks: [] as string[],
+      maxTasks,
+    };
+    fs.writeFileSync(queueFile, JSON.stringify(queue, null, 2), { mode: 0o600 });
+
+    // Write prompt for initial feature
+    const prompt = await this.buildWorkerPrompt(initialFeature);
+    const promptFile = path.join(this.workerDir, `${initialFeature.id}.prompt`);
+    fs.writeFileSync(promptFile, prompt, { mode: 0o600 });
+
+    // Check if tmux is available
+    try {
+      await execFileAsync("which", ["tmux"]);
+    } catch {
+      return { success: false, error: "tmux is not installed." };
+    }
+
+    const workerFlags = getWorkerFlags();
+    const logFile = path.join(this.workerDir, `${workerId}.continuous.log`);
+
+    // Build a loop wrapper script
+    const wrapperScript = path.join(this.workerDir, `${workerId}.loop.sh`);
+    const scriptContent = `#!/bin/bash
+set -e
+QUEUE_FILE=${shellQuote(queueFile)}
+WORKER_DIR=${shellQuote(this.workerDir)}
+PROJECT_DIR=${shellQuote(this.projectDir)}
+LOG_FILE=${shellQuote(logFile)}
+
+echo "[$(date -Iseconds)] Continuous worker ${workerId} started (max tasks: ${maxTasks})" >> "$LOG_FILE"
+
+while true; do
+  # Read next task from queue
+  FEATURE_ID=$(node -e "
+    const q = JSON.parse(require('fs').readFileSync('$QUEUE_FILE', 'utf-8'));
+    const next = q.tasks.find(t => !q.completedTasks.includes(t.featureId));
+    if (next) process.stdout.write(next.featureId);
+    else process.exit(1);
+  " 2>/dev/null) || break
+
+  echo "[$(date -Iseconds)] Starting task: $FEATURE_ID" >> "$LOG_FILE"
+
+  PROMPT_FILE="$WORKER_DIR/$FEATURE_ID.prompt"
+  TASK_LOG="$WORKER_DIR/$FEATURE_ID.log"
+
+  if [ ! -f "$PROMPT_FILE" ]; then
+    echo "[$(date -Iseconds)] ERROR: No prompt file for $FEATURE_ID" >> "$LOG_FILE"
+    break
+  fi
+
+  PROMPT=$(cat "$PROMPT_FILE")
+  cd "$PROJECT_DIR"
+
+  # Run claude for this task
+  if command -v claude-code &> /dev/null; then
+    claude-code ${workerFlags} -p "$PROMPT" 2>&1 | tee "$TASK_LOG" >> "$LOG_FILE"
+  else
+    claude ${workerFlags} -p "$PROMPT" 2>&1 | tee "$TASK_LOG" >> "$LOG_FILE"
+  fi
+
+  # Mark task done in queue
+  node -e "
+    const q = JSON.parse(require('fs').readFileSync('$QUEUE_FILE', 'utf-8'));
+    q.completedTasks.push('$FEATURE_ID');
+    require('fs').writeFileSync('$QUEUE_FILE', JSON.stringify(q, null, 2));
+  "
+
+  # Create .done file for the feature
+  echo "Completed by continuous worker ${workerId}" > "$WORKER_DIR/$FEATURE_ID.done"
+
+  echo "[$(date -Iseconds)] Completed task: $FEATURE_ID" >> "$LOG_FILE"
+done
+
+echo "[$(date -Iseconds)] Continuous worker ${workerId} finished (queue empty or max tasks reached)" >> "$LOG_FILE"
+echo 'WORKER_LOOP_EXITED' >> "$LOG_FILE"
+`;
+    fs.writeFileSync(wrapperScript, scriptContent, { mode: 0o700 });
+
+    try {
+      await execFileAsync("tmux", [
+        "new-session", "-d", "-s", sessionName,
+        "-c", this.projectDir,
+        "bash", wrapperScript,
+      ]);
+
+      // Create status file
+      const statusFile = path.join(this.workerDir, `${workerId}.status`);
+      fs.writeFileSync(
+        statusFile,
+        JSON.stringify({
+          sessionName,
+          workerId,
+          type: "continuous",
+          startedAt: new Date().toISOString(),
+          status: "running",
+          currentFeature: initialFeature.id,
+          maxTasks,
+        })
+      );
+
+      return { success: true, sessionName };
+    } catch (error: any) {
+      return { success: false, error: sanitizeOutput(error.message) };
+    }
+  }
+
+  /**
+   * Add a feature to a running continuous worker's queue.
+   * The worker will pick it up after finishing its current task.
+   */
+  async enqueueFeature(workerId: string, feature: Feature): Promise<{ success: boolean; error?: string }> {
+    const queueFile = path.join(this.workerDir, `${workerId}.queue.json`);
+
+    if (!fs.existsSync(queueFile)) {
+      return { success: false, error: `No queue found for worker ${workerId}` };
+    }
+
+    try {
+      const queue = JSON.parse(fs.readFileSync(queueFile, "utf-8"));
+
+      // Check if feature is already in queue
+      if (queue.tasks.some((t: { featureId: string }) => t.featureId === feature.id)) {
+        return { success: false, error: `Feature ${feature.id} is already in the queue` };
+      }
+
+      // Check max tasks
+      if (queue.tasks.length >= queue.maxTasks) {
+        return { success: false, error: `Queue is full (${queue.tasks.length}/${queue.maxTasks})` };
+      }
+
+      // Write prompt file for the new feature
+      const prompt = await this.buildWorkerPrompt(feature);
+      const promptFile = path.join(this.workerDir, `${feature.id}.prompt`);
+      fs.writeFileSync(promptFile, prompt, { mode: 0o600 });
+
+      // Add to queue
+      queue.tasks.push({ featureId: feature.id });
+      fs.writeFileSync(queueFile, JSON.stringify(queue, null, 2));
+
+      return { success: true };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  // ============================================================================
+  // Worker Plan Mode (Phase 1B)
+  // ============================================================================
+
+  /**
+   * Build a prompt for the plan phase (read-only, analysis only)
+   */
+  private async buildPlanPhasePrompt(feature: Feature, customPrompt?: string): Promise<string> {
+    const state = this.stateManager.load();
+    const taskContext = state?.taskDescription || "";
+    const projectContext = this.readProjectContext();
+
+    // Include learnings from previous similar features
+    let learningsSection = "";
+    const learnings = this.stateManager.findRelevantLearnings(feature.description);
+    if (learnings.length > 0) {
+      learningsSection = "\n## Learnings from Previous Features\n";
+      for (const learning of learnings) {
+        learningsSection += `- ${learning.featureType}: ${learning.successfulApproaches.join("; ")}`;
+        if (learning.commonErrors.length > 0) {
+          learningsSection += `\n  Common pitfalls: ${learning.commonErrors.join("; ")}`;
+        }
+        learningsSection += "\n";
+      }
+    }
+
+    // Auto-enrich context
+    let enrichedSection = "";
+    if (this.enricher) {
+      try {
+        const allFeatures = state?.features || [];
+        const enriched = await this.enricher.enrichFeature(feature, allFeatures);
+        const formatted = this.enricher.formatForPrompt(enriched);
+        if (formatted.trim()) {
+          enrichedSection = `\n## Enriched Context\n${formatted}\n`;
+        }
+      } catch {
+        // Non-fatal
+      }
+    }
+
+    return `You are a planning agent focused on creating an implementation plan for a feature.
+Your role is to analyze the codebase and create a detailed plan - DO NOT implement any code.
+
+## Your Task
+Create an implementation plan for: ${feature.description}
+
+## Orchestration Context
+${taskContext}
+${projectContext}
+${enrichedSection}
+${learningsSection}
+${customPrompt ? `\n## Additional Context\n${customPrompt}` : ""}
+
+## Instructions
+1. Explore the codebase to understand the current architecture
+2. Identify the files that need to be created or modified
+3. Create a step-by-step implementation plan
+4. Identify potential risks and how to mitigate them
+5. Define a clear test strategy
+6. Output your plan as a JSON file
+
+## Output Format
+Create a file at: .claude/orchestrator/workers/${feature.id}.worker-plan.json
+
+The JSON must follow this structure:
+{
+  "summary": "One paragraph overview of the approach including success criteria",
+  "steps": [
+    {
+      "description": "Specific action to take in this step",
+      "files": ["src/file1.ts", "src/file2.ts"],
+      "action": "How to verify this step is complete"
+    }
+  ],
+  "risksIdentified": ["Risk 1: description and mitigation"],
+  "testStrategy": "Detailed testing approach including what to test and how",
+  "estimatedComplexity": "low | medium | high"
+}
+
+## Important
+- You are in PLANNING mode - do NOT write any implementation code
+- Use Read, Glob, and Grep tools to explore the codebase
+- Focus on understanding existing patterns and conventions
+- Reference existing utilities and modules where applicable
+- Be specific about file paths and what changes are needed
+- Your plan will be auto-reviewed and must score >= 50 to be approved
+
+After writing the plan file, create a marker file at:
+.claude/orchestrator/workers/${feature.id}.plan-done
+
+Begin exploring and planning now.`;
+  }
+
+  /**
+   * Build a prompt for the implement phase (full tools, with approved plan)
+   */
+  private async buildImplementPhasePrompt(
+    feature: Feature,
+    approvedPlan: WorkerPlan,
+    planReview: PlanReview
+  ): Promise<string> {
+    const state = this.stateManager.load();
+
+    // Include verification commands in the implementation prompt
+    const verificationSection = state?.verificationConfig?.commands?.length
+      ? `\n## Verification Commands\nAfter implementing, run these commands to verify:\n${state.verificationConfig.commands.map(cmd => `- \`${cmd}\``).join("\n")}\n`
+      : "";
+
+    const basePrompt = await this.buildWorkerPrompt(feature);
+
+    return `${basePrompt}
+
+## Approved Implementation Plan
+Your work has been planned and the plan was approved (score: ${planReview.score}/100).
+Follow this plan step by step.
+
+### Plan Summary
+${approvedPlan.summary}
+
+### Steps
+${approvedPlan.steps.map((step, i) => `${i + 1}. ${step.description}\n   Files: ${step.files.join(", ")}\n   Verify: ${step.action}`).join("\n\n")}
+
+### Identified Risks
+${approvedPlan.risksIdentified.map(r => `- ${r}`).join("\n")}
+
+### Test Strategy
+${approvedPlan.testStrategy}
+${verificationSection}
+## Implementation Instructions
+1. Follow the plan steps in order
+2. After each step, verify it works before moving to the next
+3. If you need to deviate from the plan, document why
+4. Commit changes after completing logical groups of steps
+`;
+  }
+
+  /**
+   * Start a worker in plan-phase mode (read-only tools)
+   */
+  async startPlanPhaseWorker(
+    feature: Feature,
+    customPrompt?: string
+  ): Promise<StartWorkerResult> {
+    try {
+      validateFeatureId(feature.id);
+    } catch (error: any) {
+      return { success: false, error: `Invalid feature ID: ${error.message}` };
+    }
+
+    const sessionName = `cc-plan-${feature.id}-${Date.now().toString(36)}`;
+    const prompt = await this.buildPlanPhasePrompt(feature, customPrompt);
+
+    try {
+      await execFileAsync("which", ["tmux"]);
+    } catch {
+      return { success: false, error: "tmux is not installed." };
+    }
+
+    try {
+      const promptFile = path.join(this.workerDir, `${feature.id}.plan-phase.prompt`);
+      fs.writeFileSync(promptFile, prompt, { mode: 0o600 });
+
+      const logFile = path.join(this.workerDir, `${feature.id}.plan-phase.log`);
+      const wrapperScript = path.join(this.workerDir, `${feature.id}.plan-phase.sh`);
+
+      // Plan phase gets restricted tools (Read, Glob, Grep, Write for plan file - no Bash)
+      const planFlags = getWorkerFlags("Read,Glob,Grep,Write");
+
+      // Use worktree if available
+      const workingDir = feature.worktreePath || this.projectDir;
+
+      const scriptContent = `#!/bin/bash
+set -e
+cd ${shellQuote(workingDir)}
+PROMPT=$(cat ${shellQuote(promptFile)})
+if command -v claude-code &> /dev/null; then
+  claude-code ${planFlags} -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
+else
+  claude ${planFlags} -p "$PROMPT" 2>&1 | tee ${shellQuote(logFile)}
+fi
+echo 'PLAN_PHASE_EXITED' >> ${shellQuote(logFile)}
+`;
+      fs.writeFileSync(wrapperScript, scriptContent, { mode: 0o700 });
+
+      await execFileAsync("tmux", [
+        "new-session", "-d", "-s", sessionName,
+        "-c", workingDir,
+        "bash", wrapperScript,
+      ]);
+
+      // Create status file
+      const statusFile = path.join(this.workerDir, `${feature.id}.plan-phase.status`);
+      fs.writeFileSync(statusFile, JSON.stringify({
+        sessionName,
+        featureId: feature.id,
+        startedAt: new Date().toISOString(),
+        status: "running",
+        mode: "plan-phase",
+      }));
+
+      return { success: true, sessionName };
+    } catch (error: any) {
+      return { success: false, error: sanitizeOutput(error.message) };
+    }
+  }
+
+  /**
+   * Check if a plan-done marker file exists for a feature
+   */
+  isPlanDone(featureId: string): boolean {
+    const doneFile = path.join(this.workerDir, `${featureId}.plan-done`);
+    return fs.existsSync(doneFile);
+  }
+
+  /**
+   * Read and parse a worker plan file
+   */
+  readWorkerPlan(featureId: string): WorkerPlan | null {
+    const planFile = path.join(this.workerDir, `${featureId}.worker-plan.json`);
+    if (!fs.existsSync(planFile)) return null;
+
+    try {
+      const content = fs.readFileSync(planFile, "utf-8");
+      const reviewer = new PlanReviewer();
+      return reviewer.parsePlan(content, featureId);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Auto-review a worker plan
+   */
+  reviewWorkerPlan(
+    plan: WorkerPlan,
+    feature: Feature,
+    criteria?: ApprovalCriteria
+  ): PlanReview {
+    const reviewer = new PlanReviewer();
+    return reviewer.reviewPlan(plan, feature, criteria || DEFAULT_APPROVAL_CRITERIA);
+  }
+
+  /**
+   * Determine if a feature should use plan mode based on complexity
+   */
+  shouldUsePlanMode(feature: Feature, config?: PlanModeConfig): boolean {
+    if (!config?.enabled) return false;
+    if (feature.planMode !== undefined) return feature.planMode;
+
+    const complexity = analyzeComplexity(feature, config.complexityThreshold);
+    return complexity.score >= config.complexityThreshold;
+  }
+
+  // ============================================================================
+  // Ralph Loop (Phase 2)
+  // ============================================================================
+
+  /**
+   * Start a worker using the Ralph Loop pattern.
+   * Each iteration gets a fresh Claude session with state from filesystem.
+   */
+  async startRalphLoop(
+    feature: Feature,
+    options?: Partial<RalphLoopOptions>
+  ): Promise<StartWorkerResult> {
+    try {
+      validateFeatureId(feature.id);
+    } catch (error: any) {
+      return { success: false, error: `Invalid feature ID: ${error.message}` };
+    }
+
+    const sessionName = `cc-ralph-${feature.id}-${Date.now().toString(36)}`;
+
+    // Determine working directory (worktree or project)
+    let workingDir = this.projectDir;
+    const isolationLevel = feature.routing?.isolationLevel === "none" ? "none" : "worktree";
+
+    if (isolationLevel === "worktree") {
+      const worktreeAvailable = await this.worktreeManager.isAvailable();
+      if (worktreeAvailable) {
+        try {
+          const worktreeInfo = await this.worktreeManager.createWorktree(feature.id);
+          workingDir = worktreeInfo.worktreePath;
+          feature.worktreePath = worktreeInfo.worktreePath;
+          feature.worktreeBranch = worktreeInfo.branch;
+          feature.isolationMode = "worktree";
+        } catch (error) {
+          console.log(`Note: Could not create worktree for Ralph Loop ${feature.id}, using shared directory: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
+
+    if (!feature.worktreePath) {
+      feature.isolationMode = "none";
+      const snapshotResult = await this.createSnapshotBranch(feature.id);
+      if (!snapshotResult.success) {
+        console.log(`Note: Could not create snapshot branch for ${feature.id}: ${snapshotResult.error}`);
+      }
+    }
+
+    // Merge options with defaults
+    const loopOptions: RalphLoopOptions = {
+      ...DEFAULT_RALPH_OPTIONS,
+      progressFile: path.join(this.workerDir, `${feature.id}.progress.md`),
+      ...options,
+    };
+
+    // Build the base worker prompt (without iteration state - that's added by the script)
+    const basePrompt = await this.buildWorkerPrompt(feature);
+    const promptFile = path.join(this.workerDir, `${feature.id}.ralph.prompt`);
+    fs.writeFileSync(promptFile, basePrompt, { mode: 0o600 });
+
+    const logFile = path.join(this.workerDir, `${feature.id}.ralph.log`);
+    const doneFile = path.join(this.workerDir, `${feature.id}.done`);
+
+    // Build the Ralph Loop script
+    const script = buildRalphLoopScript({
+      featureId: feature.id,
+      promptFile,
+      progressFile: loopOptions.progressFile,
+      doneFile,
+      logFile,
+      workingDir,
+      workerFlags: getWorkerFlags(),
+      maxIterations: loopOptions.maxIterations,
+      maxDurationSeconds: loopOptions.maxDurationMinutes * 60,
+    });
+
+    const wrapperScript = path.join(this.workerDir, `${feature.id}.ralph.sh`);
+    fs.writeFileSync(wrapperScript, script, { mode: 0o700 });
+
+    try {
+      await execFileAsync("which", ["tmux"]);
+    } catch {
+      return { success: false, error: "tmux is not installed." };
+    }
+
+    try {
+      await execFileAsync("tmux", [
+        "new-session", "-d", "-s", sessionName,
+        "-c", workingDir,
+        "bash", wrapperScript,
+      ]);
+
+      // Create status file
+      const statusFile = path.join(this.workerDir, `${feature.id}.ralph.status`);
+      fs.writeFileSync(statusFile, JSON.stringify({
+        sessionName,
+        featureId: feature.id,
+        type: "ralph-loop",
+        startedAt: new Date().toISOString(),
+        status: "running",
+        maxIterations: loopOptions.maxIterations,
+        maxDurationMinutes: loopOptions.maxDurationMinutes,
+        progressFile: loopOptions.progressFile,
+      }));
+
+      // Update feature with Ralph Loop metadata
+      feature.ralphLoop = true;
+      feature.ralphIteration = 0;
+      feature.ralphMaxIterations = loopOptions.maxIterations;
+      feature.ralphProgressFile = loopOptions.progressFile;
+
+      return { success: true, sessionName };
+    } catch (error: any) {
+      return { success: false, error: sanitizeOutput(error.message) };
+    }
+  }
+
+  /**
+   * Read Ralph Loop progress for a feature
+   */
+  readRalphProgress(featureId: string): {
+    completedSteps: string[];
+    currentFocus: string[];
+    issues: string[];
+    filesModified: string[];
+    rawContent: string;
+  } | null {
+    const progressFile = path.join(this.workerDir, `${featureId}.progress.md`);
+    if (!fs.existsSync(progressFile)) return null;
+
+    try {
+      const content = fs.readFileSync(progressFile, "utf-8");
+      const parsed = parseProgressFile(content);
+      return { ...parsed, rawContent: content };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Get the current Ralph Loop iteration count from the log file
+   */
+  getRalphIteration(featureId: string): number {
+    const logFile = path.join(this.workerDir, `${featureId}.ralph.log`);
+    if (!fs.existsSync(logFile)) return 0;
+
+    try {
+      const content = fs.readFileSync(logFile, "utf-8");
+      const matches = content.match(/Starting iteration (\d+)/g);
+      return matches ? matches.length : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  // ============================================================================
+  // Crash Recovery (Phase 3B)
+  // ============================================================================
+
+  /**
+   * Recover workers after a crash.
+   * Checks which tmux sessions survived and restarts dead ones.
+   */
+  async recoverWorkers(
+    checkpoint: import("../state/manager.js").Checkpoint
+  ): Promise<{
+    recovered: string[];
+    restarted: string[];
+    abandoned: string[];
+  }> {
+    const result = { recovered: [] as string[], restarted: [] as string[], abandoned: [] as string[] };
+
+    for (const worker of checkpoint.activeWorkers) {
+      // Check if tmux session is still alive
+      let sessionAlive = false;
+      try {
+        const { stdout } = await execFileAsync("tmux", [
+          "list-sessions", "-F", "#{session_name}",
+        ]);
+        sessionAlive = stdout.includes(worker.sessionName);
+      } catch {
+        sessionAlive = false;
+      }
+
+      if (sessionAlive) {
+        result.recovered.push(worker.featureId);
+        continue;
+      }
+
+      // Session is dead - check if feature made progress
+      const doneFile = path.join(this.workerDir, `${worker.featureId}.done`);
+      if (fs.existsSync(doneFile)) {
+        // Feature completed but we missed it
+        result.recovered.push(worker.featureId);
+        continue;
+      }
+
+      // Check progress file or log for any work done
+      const progressFile = path.join(this.workerDir, `${worker.featureId}.progress.md`);
+      const logFile = path.join(this.workerDir, `${worker.featureId}.log`);
+      const ralphLog = path.join(this.workerDir, `${worker.featureId}.ralph.log`);
+
+      const hasProgress = fs.existsSync(progressFile) || fs.existsSync(logFile) || fs.existsSync(ralphLog);
+
+      if (hasProgress) {
+        // Feature has partial progress - find the feature and restart it
+        const state = this.stateManager.load();
+        const feature = state?.features.find(f => f.id === worker.featureId);
+
+        if (feature && (feature.status === "in_progress" || feature.status === "pending")) {
+          // Restart using Ralph Loop if it was a Ralph worker, otherwise standard
+          if (feature.ralphLoop) {
+            const restartResult = await this.startRalphLoop(feature);
+            if (restartResult.success) {
+              feature.workerId = restartResult.sessionName;
+              result.restarted.push(worker.featureId);
+            } else {
+              result.abandoned.push(worker.featureId);
+            }
+          } else {
+            const restartResult = await this.startWorker(feature);
+            if (restartResult.success) {
+              feature.workerId = restartResult.sessionName;
+              result.restarted.push(worker.featureId);
+            } else {
+              result.abandoned.push(worker.featureId);
+            }
+          }
+
+          if (state) {
+            this.stateManager.save(state);
+          }
+        } else {
+          result.abandoned.push(worker.featureId);
+        }
+      } else {
+        // No progress - restart from scratch
+        const state = this.stateManager.load();
+        const feature = state?.features.find(f => f.id === worker.featureId);
+
+        if (feature) {
+          feature.status = "pending";
+          feature.workerId = undefined;
+          result.abandoned.push(worker.featureId);
+
+          if (state) {
+            this.stateManager.save(state);
+          }
+        }
+      }
+    }
+
+    return result;
   }
 
   /**

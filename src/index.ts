@@ -18,7 +18,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { StateManager, OrchestratorState, Feature, WorkerStatus, ReviewWorker, ReviewConfig, AggregatedReview } from "./state/manager.js";
+import { StateManager, OrchestratorState, Feature, WorkerStatus, ReviewWorker, ReviewConfig, AggregatedReview, PlanModeConfig, RalphLoopConfig } from "./state/manager.js";
 import { WorkerManager } from "./workers/manager.js";
 import { ReviewManager, DEFAULT_REVIEW_CONFIG } from "./workers/review-manager.js";
 import { generateFeatureList } from "./utils/feature-generator.js";
@@ -42,7 +42,10 @@ import { getProposalManager, ProposalManager, type ProtocolProposal } from "./pr
 import { getBaseConstraints } from "./protocols/base-constraints.js";
 import type { BaseConstraints } from "./protocols/schema.js";
 import { SetupManager } from "./setup/manager.js";
+import { VerificationRunner } from "./workers/verification-runner.js";
 import { validateFeature } from "./utils/validation.js";
+import { DEFAULT_APPROVAL_CRITERIA } from "./workers/plan-reviewer.js";
+import type { ApprovalCriteria } from "./workers/plan-reviewer.js";
 import {
   captureGitState,
   calculateGitVerification,
@@ -80,20 +83,65 @@ async function ensureInitialized(projectDir: string): Promise<{ state: StateMana
     workerManager = new WorkerManager(validatedDir, stateManager);
     protocolRegistry = new ProtocolRegistry(validatedDir);
 
-    // Register completion callback to log when workers complete/crash
-    workerManager.onWorkerCompletion((featureId, status, output) => {
+    // Set up context enricher for auto-enriching worker prompts
+    const enricher = new ContextEnricher(validatedDir);
+    workerManager.setEnricher(enricher);
+
+    // Verification runner for auto-verifying worker output
+    const verificationRunner = new VerificationRunner();
+
+    // Register completion callback to log and auto-verify when workers complete/crash
+    workerManager.onWorkerCompletion(async (featureId, status, output) => {
       const currentState = stateManager?.load();
-      if (currentState) {
-        const feature = currentState.features.find((f) => f.id === featureId);
-        const shortOutput = output ? output.slice(0, 100).replace(/\n/g, " ") : "";
-        const logMessage =
-          status === "completed"
-            ? `[${new Date().toISOString()}] 🔔 Worker completed: ${featureId} - use mark_complete to update status`
-            : `[${new Date().toISOString()}] ⚠️ Worker crashed: ${featureId}${shortOutput ? ` - ${shortOutput}...` : ""} - use mark_complete to update status`;
+      if (!currentState) return;
+
+      const feature = currentState.features.find((f) => f.id === featureId);
+      const shortOutput = output ? output.slice(0, 100).replace(/\n/g, " ") : "";
+
+      if (status === "completed") {
+        // Auto-run verification if configured
+        const verificationConfig = currentState.verificationConfig;
+        if (verificationConfig?.commands?.length && verificationConfig.failOnError && feature) {
+          const workingDir = feature.worktreePath || validatedDir;
+          const verifyResult = await verificationRunner.runVerification(
+            verificationConfig.commands,
+            workingDir
+          );
+
+          if (!verifyResult.allPassed) {
+            const failureSummary = verificationRunner.formatForRetry(verifyResult);
+            const logMessage = `[${new Date().toISOString()}] 🚫 Worker ${featureId} completed but verification FAILED (${verifyResult.failedCount}/${verifyResult.results.length} commands). Auto-retry will occur on mark_complete.`;
+            currentState.progressLog.push(logMessage);
+
+            // Store the verification failure on the feature for retry context
+            feature.lastError = failureSummary;
+
+            currentState.lastUpdated = new Date().toISOString();
+            stateManager?.save(currentState);
+            console.error(logMessage);
+            return;
+          }
+
+          // Verification passed
+          const logMessage = `[${new Date().toISOString()}] ✅ Worker completed and verification PASSED: ${featureId} - use mark_complete to update status`;
+          currentState.progressLog.push(logMessage);
+          currentState.lastUpdated = new Date().toISOString();
+          stateManager?.save(currentState);
+          console.error(logMessage);
+          return;
+        }
+
+        // No verification configured - standard completion log
+        const logMessage = `[${new Date().toISOString()}] 🔔 Worker completed: ${featureId} - use mark_complete to update status`;
         currentState.progressLog.push(logMessage);
         currentState.lastUpdated = new Date().toISOString();
         stateManager?.save(currentState);
-        // Also log to stderr for immediate visibility
+        console.error(logMessage);
+      } else {
+        const logMessage = `[${new Date().toISOString()}] ⚠️ Worker crashed: ${featureId}${shortOutput ? ` - ${shortOutput}...` : ""} - use mark_complete to update status`;
+        currentState.progressLog.push(logMessage);
+        currentState.lastUpdated = new Date().toISOString();
+        stateManager?.save(currentState);
         console.error(logMessage);
       }
     });
@@ -1282,8 +1330,21 @@ server.tool(
       feature.completedAt = new Date().toISOString();
       resultStatus = "completed";
 
-      // Clean up snapshot branch on successful completion
-      await workers.deleteSnapshotBranch(featureId);
+      // If worker used a worktree, merge it back
+      if (feature.isolationMode === "worktree" && feature.worktreePath) {
+        const worktreeManager = workers.getWorktreeManager();
+        const mergeResult = await worktreeManager.mergeWorktree(featureId);
+        if (!mergeResult.success) {
+          const conflictList = mergeResult.conflicts?.join(", ") || "unknown files";
+          validationWarning += `\n\n⚠️ Merge conflicts on: ${conflictList}. Manual resolution required.`;
+          feature.notes = (feature.notes || "") + `\nMerge conflicts: ${conflictList}`;
+        }
+        // Clean up worktree regardless
+        await worktreeManager.removeWorktree(featureId);
+      } else {
+        // Legacy mode: clean up snapshot branch on successful completion
+        await workers.deleteSnapshotBranch(featureId);
+      }
     } else {
       // Check if we should auto-retry
       if (maxRetries > 0 && feature.attempts < maxRetries) {
@@ -1301,9 +1362,19 @@ server.tool(
         }
         resultStatus = `failed (${feature.attempts} attempts exhausted)`;
       }
+
+      // Clean up worktree for failed features (no merge - discard changes)
+      if (feature.isolationMode === "worktree" && feature.worktreePath && !willRetry) {
+        const worktreeManager = workers.getWorktreeManager();
+        await worktreeManager.removeWorktree(featureId);
+      }
     }
 
     feature.workerId = undefined;
+
+    // Release any file locks held by this feature
+    const lockManager = workers.getLockManager();
+    lockManager.releaseAll(featureId);
 
     // Log progress
     let logEntry: string;
@@ -1898,12 +1969,26 @@ server.tool(
     // Clean up all swarm/* snapshot branches
     const branchesDeleted = await workers.cleanupAllSnapshotBranches();
 
+    // Clean up all worktrees
+    const worktreeManager = workers.getWorktreeManager();
+    const worktreesCleaned = await worktreeManager.cleanupAll();
+
+    // Clear all file locks
+    const lockManager = workers.getLockManager();
+    const locksCleared = lockManager.clearAll();
+
     // Clear state
     state.clear();
 
     let response = "🔄 Orchestration reset. All workers killed and state cleared.";
     if (branchesDeleted > 0) {
       response += `\n🗑️ Cleaned up ${branchesDeleted} snapshot branch(es).`;
+    }
+    if (worktreesCleaned > 0) {
+      response += `\n🗑️ Cleaned up ${worktreesCleaned} worktree(s).`;
+    }
+    if (locksCleared > 0) {
+      response += `\n🗑️ Cleared ${locksCleared} file lock(s).`;
     }
     response += "\n\nUse orchestrator_init to start a new session.";
 
@@ -2227,12 +2312,14 @@ server.tool(
 // ============================================================================
 server.tool(
   "resume_session",
-  "Resume a paused orchestration session. Changes status back to in_progress and returns the list of pending features ready to work on.",
+  "Resume a paused or crashed orchestration session. Handles crash recovery: detects dead workers, restarts from checkpoints, and resumes auto-orchestration.",
   {
     projectDir: z.string().describe("Absolute path to the project directory"),
+    fromCheckpoint: z.string().optional().describe("Specific checkpoint ID to restore from, or 'latest' (default: auto-detect)"),
+    restartDeadWorkers: z.boolean().optional().describe("Restart workers that died during crash (default: true)"),
   },
-  async ({ projectDir }) => {
-    const { state } = await ensureInitialized(projectDir);
+  async ({ projectDir, fromCheckpoint, restartDeadWorkers = true }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
     const current = state.load();
 
     if (!current) {
@@ -2241,33 +2328,84 @@ server.tool(
       };
     }
 
-    // Check if session is paused
-    if (current.status !== "paused") {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `⚠️ Session is not paused (current status: ${current.status}). Use pause_session first to pause, or orchestrator_status to check current state.`,
-          },
-        ],
-      };
+    // Crash recovery: detect if previous session crashed
+    const crashInfo = state.detectCrash();
+    let recoveryReport = "";
+
+    if (crashInfo.crashed && crashInfo.checkpoint) {
+      recoveryReport += `🔧 Crash detected! Recovering from checkpoint...\n`;
+      const checkpoint = fromCheckpoint === "latest" || !fromCheckpoint
+        ? crashInfo.checkpoint
+        : state.loadCheckpoint(fromCheckpoint) || crashInfo.checkpoint;
+
+      recoveryReport += `  Checkpoint: ${checkpoint.id} (${checkpoint.reason})\n`;
+      recoveryReport += `  Active workers at crash: ${checkpoint.activeWorkers.length}\n`;
+
+      // Restore state from checkpoint if current state is corrupted
+      if (current.status !== "paused" && current.status !== "in_progress") {
+        // State might be stale - use checkpoint state
+        const restoredState = checkpoint.state;
+        restoredState.status = "in_progress";
+        restoredState.lastUpdated = new Date().toISOString();
+        restoredState.progressLog.push(
+          `[${new Date().toISOString()}] 🔧 State restored from checkpoint ${checkpoint.id}`
+        );
+        state.save(restoredState);
+      }
+
+      // Recover workers
+      if (restartDeadWorkers && checkpoint.activeWorkers.length > 0) {
+        const recovery = await workers.recoverWorkers(checkpoint);
+        recoveryReport += `\n  Recovery results:\n`;
+        if (recovery.recovered.length > 0) {
+          recoveryReport += `    Still alive: ${recovery.recovered.join(", ")}\n`;
+        }
+        if (recovery.restarted.length > 0) {
+          recoveryReport += `    Restarted: ${recovery.restarted.join(", ")}\n`;
+        }
+        if (recovery.abandoned.length > 0) {
+          recoveryReport += `    Reset to pending: ${recovery.abandoned.join(", ")}\n`;
+        }
+      }
+
+      // Reload after recovery
+      const recoveredState = state.load()!;
+      recoveredState.status = "in_progress";
+      recoveredState.progressLog.push(
+        `[${new Date().toISOString()}] ▶️ Session recovered from crash`
+      );
+      state.save(recoveredState);
+      state.writeProgressFile();
+    } else {
+      // Normal resume (not a crash)
+      if (current.status !== "paused") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `⚠️ Session is not paused (current status: ${current.status}). Use pause_session first to pause, or orchestrator_status to check current state.`,
+            },
+          ],
+        };
+      }
+
+      current.status = "in_progress";
+      current.lastUpdated = new Date().toISOString();
+      current.progressLog.push(`[${new Date().toISOString()}] ▶️ Session resumed`);
+      state.save(current);
+      state.writeProgressFile();
     }
 
-    // Resume the session
-    current.status = "in_progress";
-    current.lastUpdated = new Date().toISOString();
-    current.progressLog.push(`[${new Date().toISOString()}] ▶️ Session resumed`);
+    const finalState = state.load()!;
+    const pendingFeatures = finalState.features.filter(f => f.status === "pending");
+    const completedFeatures = finalState.features.filter(f => f.status === "completed");
+    const failedFeatures = finalState.features.filter(f => f.status === "failed");
+    const inProgressFeatures = finalState.features.filter(f => f.status === "in_progress");
 
-    state.save(current);
-    state.writeProgressFile();
-
-    const pendingFeatures = current.features.filter(f => f.status === "pending");
-    const completedFeatures = current.features.filter(f => f.status === "completed");
-    const failedFeatures = current.features.filter(f => f.status === "failed");
-
-    let responseText = `▶️ Session resumed!\n\n`;
-    responseText += `📊 Current Status:\n`;
+    let responseText = recoveryReport || `▶️ Session resumed!\n\n`;
+    responseText += `\n📊 Current Status:\n`;
     responseText += `  ✅ Completed: ${completedFeatures.length}\n`;
+    responseText += `  🔄 In progress: ${inProgressFeatures.length}\n`;
     responseText += `  ⏳ Pending: ${pendingFeatures.length}\n`;
     responseText += `  ❌ Failed: ${failedFeatures.length}\n\n`;
 
@@ -2276,11 +2414,20 @@ server.tool(
       for (const f of pendingFeatures) {
         responseText += `  - ${f.id}: ${f.description}\n`;
       }
-      responseText += `\nUse start_worker or start_parallel_workers to begin.`;
+      responseText += `\nUse start_worker, start_ralph_loop, or auto_orchestrate to begin.`;
+    } else if (inProgressFeatures.length > 0) {
+      responseText += `Workers are running. Use check_worker to monitor progress.`;
     } else if (failedFeatures.length > 0) {
       responseText += `⚠️ No pending features. Consider retrying failed features.`;
     } else {
       responseText += `🎉 All features are completed!`;
+    }
+
+    // List available checkpoints
+    const checkpoints = state.listCheckpoints();
+    if (checkpoints.length > 0) {
+      responseText += `\n\n📸 Available checkpoints: ${checkpoints.length}`;
+      responseText += `\n  Latest: ${checkpoints[0].id} (${checkpoints[0].reason})`;
     }
 
     return {
@@ -6277,6 +6424,119 @@ function getActionIcon(action: string): string {
 // ============================================================================
 // TOOL: auto_orchestrate
 // ============================================================================
+// ============================================================================
+// TOOL: start_continuous_worker
+// ============================================================================
+server.tool(
+  "start_continuous_worker",
+  "Start a Claude Code worker that processes multiple features sequentially in a loop. The worker picks up new tasks from a queue, reducing startup overhead. Inspired by the infinite-loop pattern from 'Building a C compiler with parallel Claudes'.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    featureId: z.string().describe("First feature to work on"),
+    workerId: z.string().optional().describe("Worker identifier (default: auto-generated)"),
+    maxTasks: z.number().min(1).max(50).optional().describe("Maximum features before worker exits (default: 10)"),
+  },
+  async ({ projectDir, featureId, workerId, maxTasks }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
+
+    try {
+      validateFeatureId(featureId);
+    } catch (error: any) {
+      return { content: [{ type: "text", text: `Invalid feature ID: ${error.message}` }] };
+    }
+
+    const current = state.load();
+    if (!current) {
+      return { content: [{ type: "text", text: "No active session. Use orchestrator_init first." }] };
+    }
+
+    const feature = current.features.find(f => f.id === featureId);
+    if (!feature) {
+      return { content: [{ type: "text", text: `Feature '${featureId}' not found.` }] };
+    }
+
+    const id = workerId || `continuous-${Date.now().toString(36)}`;
+    const result = await workers.startContinuousWorker(feature, id, { maxTasks });
+
+    if (!result.success) {
+      return { content: [{ type: "text", text: `Failed to start continuous worker: ${result.error}` }] };
+    }
+
+    // Update feature status
+    feature.status = "in_progress";
+    feature.workerId = result.sessionName;
+    feature.startedAt = new Date().toISOString();
+    feature.attempts++;
+
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 🔄 Continuous worker started: ${id} (session: ${result.sessionName}, first task: ${featureId}, max tasks: ${maxTasks || 10})`
+    );
+    current.lastUpdated = new Date().toISOString();
+    state.save(current);
+
+    return {
+      content: [{
+        type: "text",
+        text: `🔄 Continuous worker started!\n  Worker ID: ${id}\n  Session: ${result.sessionName}\n  First task: ${featureId}\n  Max tasks: ${maxTasks || 10}\n\nUse enqueue_feature to add more tasks to this worker.`,
+      }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: enqueue_feature
+// ============================================================================
+server.tool(
+  "enqueue_feature",
+  "Add a feature to a running continuous worker's task queue. The worker will pick it up after finishing its current task.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    workerId: z.string().describe("The continuous worker's ID"),
+    featureId: z.string().describe("Feature ID to add to the queue"),
+  },
+  async ({ projectDir, workerId, featureId }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
+
+    try {
+      validateFeatureId(featureId);
+    } catch (error: any) {
+      return { content: [{ type: "text", text: `Invalid feature ID: ${error.message}` }] };
+    }
+
+    const current = state.load();
+    if (!current) {
+      return { content: [{ type: "text", text: "No active session." }] };
+    }
+
+    const feature = current.features.find(f => f.id === featureId);
+    if (!feature) {
+      return { content: [{ type: "text", text: `Feature '${featureId}' not found.` }] };
+    }
+
+    const result = await workers.enqueueFeature(workerId, feature);
+
+    if (!result.success) {
+      return { content: [{ type: "text", text: `Failed to enqueue: ${result.error}` }] };
+    }
+
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 📥 Enqueued ${featureId} to continuous worker ${workerId}`
+    );
+    current.lastUpdated = new Date().toISOString();
+    state.save(current);
+
+    return {
+      content: [{
+        type: "text",
+        text: `📥 Feature ${featureId} added to worker ${workerId}'s queue. It will be processed after the current task completes.`,
+      }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: auto_orchestrate
+// ============================================================================
 server.tool(
   "auto_orchestrate",
   "Automatically schedule and monitor workers based on priority, dependencies, and worker health. Runs hands-free until all features complete.",
@@ -6319,6 +6579,15 @@ server.tool(
       // -20 points per previous attempt (struggling)
       score -= (feature.attempts || 0) * 20;
 
+      // Routing-aware: boost features whose affinity group has running workers (co-locate related work)
+      if (feature.routing?.affinityGroup) {
+        const runningInGroup = allFeatures.filter(f =>
+          f.status === "in_progress" &&
+          f.routing?.affinityGroup === feature.routing!.affinityGroup
+        ).length;
+        if (runningInGroup > 0) score += 25;
+      }
+
       // Strategy-specific adjustments
       if (strategy === "breadth-first") {
         // Prefer features with no dependencies
@@ -6345,60 +6614,623 @@ server.tool(
           if (unmetDeps.length > 0) return false;
         }
 
+        // Respect maxParallelism from routing config
+        if (f.routing?.maxParallelism) {
+          const sameGroupRunning = current!.features.filter(other =>
+            other.status === "in_progress" &&
+            other.routing?.affinityGroup === f.routing?.affinityGroup
+          ).length;
+          if (sameGroupRunning >= f.routing.maxParallelism) return false;
+        }
+
         return true;
       });
     }
 
-    // Start orchestration
+    // Execution loop: runs autonomously until all features complete or safety limit reached
     let iterationCount = 0;
-    const maxIterations = 100; // Safety limit
+    const maxIterations = 200; // Safety limit
     let totalStarted = 0;
     let totalCompleted = 0;
+    let totalFailed = 0;
 
     current.progressLog.push(
-      `[${new Date().toISOString()}] 🤖 Auto-orchestration started (strategy: ${strategy}, maxConcurrent: ${maxConcurrent})`
+      `[${new Date().toISOString()}] 🤖 Auto-orchestration started (strategy: ${strategy}, maxConcurrent: ${maxConcurrent}, check interval: ${checkIntervalSeconds}s)`
     );
     state.save(current);
 
-    // Main orchestration loop would go here in a real implementation
-    // For now, we'll return a plan of what would be executed
+    const verificationRunner = new VerificationRunner();
 
-    const readyFeatures = getReadyFeatures();
-    const prioritized = readyFeatures
-      .map(f => ({ feature: f, priority: calculatePriority(f, current.features) }))
-      .sort((a, b) => b.priority - a.priority);
+    while (iterationCount < maxIterations) {
+      iterationCount++;
 
-    const nextBatch = prioritized.slice(0, maxConcurrent);
+      // Reload state (may have been modified by completion callbacks)
+      const freshState = state.load();
+      if (!freshState) break;
 
-    let response = `🤖 Auto-Orchestration Plan\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+      // Count features by status
+      const pending = freshState.features.filter(f => f.status === "pending");
+      const inProgress = freshState.features.filter(f => f.status === "in_progress");
+      const completed = freshState.features.filter(f => f.status === "completed");
+      const failed = freshState.features.filter(f => f.status === "failed");
+
+      // Check if all done (no pending or in-progress)
+      if (pending.length === 0 && inProgress.length === 0) {
+        freshState.progressLog.push(
+          `[${new Date().toISOString()}] 🏁 Auto-orchestration finished: ${completed.length} completed, ${failed.length} failed`
+        );
+        state.save(freshState);
+        break;
+      }
+
+      // Process completions: check each in-progress worker
+      for (const feature of inProgress) {
+        if (!feature.workerId) continue;
+
+        const checkResult = await workers.checkWorker(feature.workerId, 20);
+
+        // Handle plan-phase completion separately
+        if (feature.planPhase === "planning" && (checkResult.status === "completed" || checkResult.status === "crashed")) {
+          if (workers.isPlanDone(feature.id)) {
+            const plan = workers.readWorkerPlan(feature.id);
+            if (plan) {
+              const criteria = freshState.planModeConfig?.approvalCriteria || DEFAULT_APPROVAL_CRITERIA;
+              const review = workers.reviewWorkerPlan(plan, feature, criteria);
+
+              feature.workerPlan = plan;
+              feature.planReview = review;
+
+              if (review.approved) {
+                // Plan approved - start implement phase
+                feature.planPhase = "implementing";
+                const implResult = await workers.startWorker(feature);
+                if (implResult.success) {
+                  feature.workerId = implResult.sessionName;
+                  freshState.progressLog.push(
+                    `[${new Date().toISOString()}] ✅ Plan approved for ${feature.id} (score: ${review.score}). Starting implementation.`
+                  );
+                }
+              } else {
+                // Plan rejected - re-plan or fallback
+                const maxReplans = freshState.planModeConfig?.maxReplanAttempts ?? 2;
+                if ((feature.planAttempts || 0) < maxReplans) {
+                  feature.planPhase = "planning";
+                  feature.planAttempts = (feature.planAttempts || 0) + 1;
+                  const replanResult = await workers.startPlanPhaseWorker(
+                    feature,
+                    `Previous plan was rejected (score: ${review.score}). Feedback: ${review.feedback}\nSuggestions: ${review.suggestions.join("; ")}`
+                  );
+                  if (replanResult.success) {
+                    feature.workerId = replanResult.sessionName;
+                    freshState.progressLog.push(
+                      `[${new Date().toISOString()}] 🔄 Re-planning ${feature.id} (attempt ${feature.planAttempts}, score: ${review.score})`
+                    );
+                  }
+                } else {
+                  // Fallback: implement without plan
+                  feature.planPhase = "implementing";
+                  const implResult = await workers.startWorker(feature);
+                  if (implResult.success) {
+                    feature.workerId = implResult.sessionName;
+                    freshState.progressLog.push(
+                      `[${new Date().toISOString()}] ⚠️ Plan mode exhausted for ${feature.id}. Starting implementation without plan.`
+                    );
+                  }
+                }
+              }
+            } else {
+              // Plan file not readable - fallback to implement without plan
+              feature.planPhase = "implementing";
+              const implResult = await workers.startWorker(feature);
+              if (implResult.success) {
+                feature.workerId = implResult.sessionName;
+                freshState.progressLog.push(
+                  `[${new Date().toISOString()}] ⚠️ Plan not readable for ${feature.id}. Starting implementation without plan.`
+                );
+              }
+            }
+          } else {
+            // Plan phase crashed or didn't produce plan - fallback
+            feature.planPhase = "implementing";
+            const implResult = await workers.startWorker(feature);
+            if (implResult.success) {
+              feature.workerId = implResult.sessionName;
+              freshState.progressLog.push(
+                `[${new Date().toISOString()}] ⚠️ Plan phase failed for ${feature.id}. Starting implementation directly.`
+              );
+            }
+          }
+          continue;
+        }
+
+        if (checkResult.status === "completed" || checkResult.status === "crashed") {
+          const isSuccess = checkResult.status === "completed";
+
+          // Auto-verification for completed workers
+          let verificationPassed = true;
+          if (isSuccess && freshState.verificationConfig?.commands?.length && freshState.verificationConfig.failOnError) {
+            const workDir = feature.worktreePath || projectDir;
+            const verifyResult = await verificationRunner.runVerification(
+              freshState.verificationConfig.commands,
+              workDir
+            );
+            verificationPassed = verifyResult.allPassed;
+            if (!verificationPassed) {
+              feature.lastError = verificationRunner.formatForRetry(verifyResult);
+            }
+          }
+
+          const actualSuccess = isSuccess && verificationPassed;
+
+          if (actualSuccess) {
+            // Merge worktree if applicable
+            if (feature.isolationMode === "worktree" && feature.worktreePath) {
+              const worktreeManager = workers.getWorktreeManager();
+              const mergeResult = await worktreeManager.mergeWorktree(feature.id);
+              if (!mergeResult.success) {
+                feature.notes = (feature.notes || "") + `\nMerge conflicts: ${mergeResult.conflicts?.join(", ")}`;
+              }
+              await worktreeManager.removeWorktree(feature.id);
+            } else {
+              await workers.deleteSnapshotBranch(feature.id);
+            }
+
+            feature.status = "completed";
+            feature.completedAt = new Date().toISOString();
+            feature.planPhase = undefined;
+            totalCompleted++;
+
+            // Record learning for future features
+            try {
+              state.recordLearning({
+                featureType: feature.description.substring(0, 100),
+                commonErrors: feature.lastError ? [feature.lastError.substring(0, 200)] : [],
+                successfulApproaches: feature.workerPlan?.summary ? [feature.workerPlan.summary.substring(0, 200)] : [],
+                iterations: feature.ralphIteration || feature.attempts,
+                planWasUseful: !!feature.workerPlan,
+              });
+            } catch {
+              // Non-fatal
+            }
+
+            // Checkpoint on feature completion
+            try {
+              await state.checkpoint("feature_complete");
+            } catch {
+              // Non-fatal
+            }
+
+            freshState.progressLog.push(
+              `[${new Date().toISOString()}] ✅ Auto-completed: ${feature.id}`
+            );
+          } else {
+            // Failed or verification failed - check for retry
+            const maxRetries = feature.maxRetries ?? 3;
+            if (feature.attempts < maxRetries) {
+              feature.status = "pending";
+              feature.lastError = feature.lastError || checkResult.output?.slice(0, 200) || "Worker failed";
+
+              // Clean up worktree for retry
+              if (feature.isolationMode === "worktree" && feature.worktreePath) {
+                const worktreeManager = workers.getWorktreeManager();
+                await worktreeManager.removeWorktree(feature.id);
+                feature.worktreePath = undefined;
+                feature.worktreeBranch = undefined;
+              }
+
+              freshState.progressLog.push(
+                `[${new Date().toISOString()}] 🔄 Auto-retry queued: ${feature.id} (attempt ${feature.attempts}/${maxRetries})`
+              );
+            } else {
+              feature.status = "failed";
+              feature.completedAt = new Date().toISOString();
+              totalFailed++;
+
+              // Clean up worktree
+              if (feature.isolationMode === "worktree" && feature.worktreePath) {
+                const worktreeManager = workers.getWorktreeManager();
+                await worktreeManager.removeWorktree(feature.id);
+              }
+
+              freshState.progressLog.push(
+                `[${new Date().toISOString()}] ❌ Auto-failed (exhausted retries): ${feature.id}`
+              );
+            }
+          }
+
+          // Release locks and clear worker ID
+          const lockManager = workers.getLockManager();
+          lockManager.releaseAll(feature.id);
+          feature.workerId = undefined;
+        }
+      }
+
+      // Start new workers for ready features
+      // Re-evaluate ready features after processing completions
+      const readyFeatures = freshState.features.filter(f => {
+        if (f.status !== "pending") return false;
+        if (f.dependsOn && f.dependsOn.length > 0) {
+          const unmetDeps = f.dependsOn.filter(depId => {
+            const dep = freshState.features.find(df => df.id === depId);
+            return !dep || dep.status !== "completed";
+          });
+          if (unmetDeps.length > 0) return false;
+        }
+        if (f.routing?.maxParallelism) {
+          const sameGroupRunning = freshState.features.filter(other =>
+            other.status === "in_progress" &&
+            other.routing?.affinityGroup === f.routing?.affinityGroup
+          ).length;
+          if (sameGroupRunning >= f.routing.maxParallelism) return false;
+        }
+        return true;
+      });
+
+      const currentlyRunning = freshState.features.filter(f => f.status === "in_progress").length;
+      const availableSlots = maxConcurrent - currentlyRunning;
+
+      if (availableSlots > 0 && readyFeatures.length > 0) {
+        // Prioritize and start
+        const prioritized = readyFeatures
+          .map(f => ({ feature: f, priority: calculatePriority(f, freshState.features) }))
+          .sort((a, b) => b.priority - a.priority);
+
+        const batch = prioritized.slice(0, availableSlots);
+
+        for (const { feature } of batch) {
+          // Determine execution mode: plan mode, Ralph Loop, or standard
+          const usePlanMode = workers.shouldUsePlanMode(feature, freshState.planModeConfig || undefined);
+          const useRalphLoop = freshState.ralphLoopConfig?.enabled ?? false;
+
+          let startResult;
+          let mode = "standard";
+
+          if (usePlanMode && !feature.planPhase) {
+            // Start plan phase first
+            feature.planPhase = "planning";
+            feature.planAttempts = (feature.planAttempts || 0) + 1;
+            startResult = await workers.startPlanPhaseWorker(feature);
+            mode = "plan-phase";
+          } else if (useRalphLoop) {
+            // Use Ralph Loop
+            startResult = await workers.startRalphLoop(feature, {
+              maxIterations: freshState.ralphLoopConfig!.maxIterations,
+              maxDurationMinutes: freshState.ralphLoopConfig!.maxDurationMinutes,
+              stopOnComplete: freshState.ralphLoopConfig!.stopOnComplete,
+              verifyBeforeStop: freshState.ralphLoopConfig!.verifyBeforeStop,
+            });
+            mode = "ralph-loop";
+          } else {
+            // Standard single-run worker
+            startResult = await workers.startWorker(feature);
+          }
+
+          if (startResult.success) {
+            feature.status = "in_progress";
+            feature.workerId = startResult.sessionName;
+            feature.startedAt = new Date().toISOString();
+            feature.attempts++;
+            totalStarted++;
+
+            freshState.progressLog.push(
+              `[${new Date().toISOString()}] 🚀 Auto-started: ${feature.id} (${mode}, attempt ${feature.attempts})`
+            );
+          }
+        }
+      }
+
+      freshState.lastUpdated = new Date().toISOString();
+      state.save(freshState);
+
+      // Write heartbeat for crash detection
+      state.writeHeartbeat(`auto-${Date.now().toString(36)}`, true);
+
+      // Periodic checkpoint (every ~15 minutes based on check interval)
+      if (iterationCount % Math.max(1, Math.floor(900 / checkIntervalSeconds)) === 0) {
+        try {
+          const activeWorkerCheckpoints = freshState.features
+            .filter(f => f.status === "in_progress" && f.workerId)
+            .map(f => ({
+              featureId: f.id,
+              sessionName: f.workerId!,
+              tmuxAlive: true,
+              lastProgress: "",
+              iteration: f.ralphIteration || 0,
+              phase: (f.planPhase || "implementing") as "planning" | "implementing",
+            }));
+          await state.checkpoint("periodic", activeWorkerCheckpoints);
+        } catch {
+          // Non-fatal - checkpoint failure shouldn't stop orchestration
+        }
+      }
+
+      // Wait before next check
+      await new Promise(resolve => setTimeout(resolve, checkIntervalSeconds * 1000));
+    }
+
+    // Clean up heartbeat
+    state.removeHeartbeat();
+
+    // Build final summary
+    const finalState = state.load()!;
+    const completedFeatures = finalState.features.filter(f => f.status === "completed");
+    const failedFeatures = finalState.features.filter(f => f.status === "failed");
+    const pendingFeatures = finalState.features.filter(f => f.status === "pending");
+
+    let response = `🤖 Auto-Orchestration Complete\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
     response += `Strategy: ${strategy}\n`;
-    response += `Max Concurrent: ${maxConcurrent}\n`;
-    response += `Ready Features: ${readyFeatures.length}\n\n`;
+    response += `Iterations: ${iterationCount}\n`;
+    response += `Workers started: ${totalStarted}\n\n`;
+    response += `Results:\n`;
+    response += `  ✅ Completed: ${completedFeatures.length}\n`;
+    response += `  ❌ Failed: ${failedFeatures.length}\n`;
+    if (pendingFeatures.length > 0) {
+      response += `  ⏳ Still pending: ${pendingFeatures.length}\n`;
+    }
 
-    if (nextBatch.length > 0) {
-      response += `📊 Next Batch (${nextBatch.length} features):\n`;
-      for (const { feature, priority } of nextBatch) {
-        response += `  ${feature.id} (priority: ${priority}) - ${feature.description.substring(0, 60)}...\n`;
+    if (failedFeatures.length > 0) {
+      response += `\nFailed features:\n`;
+      for (const f of failedFeatures) {
+        response += `  - ${f.id}: ${f.lastError?.substring(0, 80) || "No details"}\n`;
       }
+    }
 
-      response += `\n💡 To execute this plan, use:\n`;
-      response += `start_parallel_workers(featureIds=[`;
-      response += nextBatch.map(b => `"${b.feature.id}"`).join(", ");
-      response += `])\n\n`;
-
-      response += `Then check progress periodically with check_all_workers.`;
-    } else {
-      response += `✅ No features ready to start.\n`;
-      const pending = current.features.filter(f => f.status === "pending");
-      if (pending.length > 0) {
-        response += `\n${pending.length} features pending but blocked by dependencies.`;
-      } else {
-        response += `\nAll features completed!`;
-      }
+    if (iterationCount >= maxIterations) {
+      response += `\n⚠️ Safety limit reached (${maxIterations} iterations). Some features may be incomplete.`;
     }
 
     return {
       content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: configure_plan_mode
+// ============================================================================
+server.tool(
+  "configure_plan_mode",
+  "Configure worker plan mode. When enabled, workers analyze the codebase and produce a plan before implementing. Plans are auto-approved by the orchestrator.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    enabled: z.boolean().optional().describe("Enable/disable plan mode globally (default: true)"),
+    complexityThreshold: z.number().min(0).max(100).optional().describe("Minimum complexity score to trigger plan mode (default: 30)"),
+    requireTestStrategy: z.boolean().optional().describe("Require test strategy in plans (default: true)"),
+    requireRiskAssessment: z.boolean().optional().describe("Require risk assessment in plans (default: true)"),
+    maxSteps: z.number().min(1).max(50).optional().describe("Maximum steps allowed in a plan (default: 20)"),
+    requireFileList: z.boolean().optional().describe("Require file list in plans (default: true)"),
+    maxReplanAttempts: z.number().min(0).max(5).optional().describe("Maximum re-plan attempts before fallback (default: 2)"),
+  },
+  async ({ projectDir, enabled, complexityThreshold, requireTestStrategy, requireRiskAssessment, maxSteps, requireFileList, maxReplanAttempts }) => {
+    const { state } = await ensureInitialized(projectDir);
+    const current = state.load();
+
+    if (!current) {
+      return { content: [{ type: "text", text: "No active session. Use orchestrator_init first." }] };
+    }
+
+    // Build config from params, merging with existing
+    const existingConfig = current.planModeConfig;
+    const config: PlanModeConfig = {
+      enabled: enabled ?? existingConfig?.enabled ?? true,
+      complexityThreshold: complexityThreshold ?? existingConfig?.complexityThreshold ?? 30,
+      maxReplanAttempts: maxReplanAttempts ?? existingConfig?.maxReplanAttempts ?? 2,
+      approvalCriteria: {
+        requireTestStrategy: requireTestStrategy ?? existingConfig?.approvalCriteria?.requireTestStrategy ?? true,
+        requireRiskAssessment: requireRiskAssessment ?? existingConfig?.approvalCriteria?.requireRiskAssessment ?? true,
+        maxSteps: maxSteps ?? existingConfig?.approvalCriteria?.maxSteps ?? 20,
+        requireFileList: requireFileList ?? existingConfig?.approvalCriteria?.requireFileList ?? true,
+      },
+    };
+
+    current.planModeConfig = config;
+    current.progressLog.push(
+      `[${new Date().toISOString()}] Plan mode configured: enabled=${config.enabled}, threshold=${config.complexityThreshold}, maxReplans=${config.maxReplanAttempts}`
+    );
+    state.save(current);
+
+    return {
+      content: [{
+        type: "text",
+        text: `Plan mode configured:\n  Enabled: ${config.enabled}\n  Complexity threshold: ${config.complexityThreshold}\n  Max re-plan attempts: ${config.maxReplanAttempts}\n  Require test strategy: ${config.approvalCriteria.requireTestStrategy}\n  Require risk assessment: ${config.approvalCriteria.requireRiskAssessment}\n  Max steps: ${config.approvalCriteria.maxSteps}\n  Require file list: ${config.approvalCriteria.requireFileList}`,
+      }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: configure_ralph_loop
+// ============================================================================
+server.tool(
+  "configure_ralph_loop",
+  "Configure Ralph Loop execution mode. When enabled, workers get fresh context each iteration with state loaded from filesystem. Supports hours/days-long autonomous sessions.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    enabled: z.boolean().optional().describe("Enable/disable Ralph Loop globally (default: false)"),
+    maxIterations: z.number().min(1).max(200).optional().describe("Maximum iterations per feature (default: 50)"),
+    maxDurationMinutes: z.number().min(1).max(14400).optional().describe("Maximum duration in minutes per feature (default: 480 = 8 hours)"),
+    stopOnComplete: z.boolean().optional().describe("Stop when .done file detected (default: true)"),
+    verifyBeforeStop: z.boolean().optional().describe("Run verification before stopping (default: true)"),
+  },
+  async ({ projectDir, enabled, maxIterations, maxDurationMinutes, stopOnComplete, verifyBeforeStop }) => {
+    const { state } = await ensureInitialized(projectDir);
+    const current = state.load();
+
+    if (!current) {
+      return { content: [{ type: "text", text: "No active session. Use orchestrator_init first." }] };
+    }
+
+    const existingConfig = current.ralphLoopConfig;
+    const config: RalphLoopConfig = {
+      enabled: enabled ?? existingConfig?.enabled ?? false,
+      maxIterations: maxIterations ?? existingConfig?.maxIterations ?? 50,
+      maxDurationMinutes: maxDurationMinutes ?? existingConfig?.maxDurationMinutes ?? 480,
+      stopOnComplete: stopOnComplete ?? existingConfig?.stopOnComplete ?? true,
+      verifyBeforeStop: verifyBeforeStop ?? existingConfig?.verifyBeforeStop ?? true,
+    };
+
+    current.ralphLoopConfig = config;
+    current.progressLog.push(
+      `[${new Date().toISOString()}] Ralph Loop configured: enabled=${config.enabled}, maxIterations=${config.maxIterations}, maxDuration=${config.maxDurationMinutes}min`
+    );
+    state.save(current);
+
+    return {
+      content: [{
+        type: "text",
+        text: `Ralph Loop configured:\n  Enabled: ${config.enabled}\n  Max iterations: ${config.maxIterations}\n  Max duration: ${config.maxDurationMinutes} minutes\n  Stop on complete: ${config.stopOnComplete}\n  Verify before stop: ${config.verifyBeforeStop}`,
+      }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: start_ralph_loop
+// ============================================================================
+server.tool(
+  "start_ralph_loop",
+  "Start a worker using the Ralph Loop pattern. Each iteration gets a fresh Claude session with state loaded from filesystem (progress files, git diff). Eliminates context rot for long-running tasks.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    featureId: z.string().describe("Feature to work on"),
+    maxIterations: z.number().min(1).max(200).optional().describe("Maximum iterations (default: 50)"),
+    maxDurationMinutes: z.number().min(1).max(14400).optional().describe("Maximum duration in minutes (default: 480)"),
+  },
+  async ({ projectDir, featureId, maxIterations, maxDurationMinutes }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
+
+    try {
+      validateFeatureId(featureId);
+    } catch (error: any) {
+      return { content: [{ type: "text", text: `Invalid feature ID: ${error.message}` }] };
+    }
+
+    const current = state.load();
+    if (!current) {
+      return { content: [{ type: "text", text: "No active session. Use orchestrator_init first." }] };
+    }
+
+    const feature = current.features.find(f => f.id === featureId);
+    if (!feature) {
+      return { content: [{ type: "text", text: `Feature '${featureId}' not found.` }] };
+    }
+
+    if (feature.status === "completed") {
+      return { content: [{ type: "text", text: `Feature '${featureId}' is already completed.` }] };
+    }
+
+    const options: Partial<import("./workers/ralph-loop.js").RalphLoopOptions> = {};
+    if (maxIterations) options.maxIterations = maxIterations;
+    if (maxDurationMinutes) options.maxDurationMinutes = maxDurationMinutes;
+
+    // Apply global defaults if configured
+    const globalConfig = current.ralphLoopConfig;
+    if (globalConfig) {
+      if (!maxIterations) options.maxIterations = globalConfig.maxIterations;
+      if (!maxDurationMinutes) options.maxDurationMinutes = globalConfig.maxDurationMinutes;
+      options.stopOnComplete = globalConfig.stopOnComplete;
+      options.verifyBeforeStop = globalConfig.verifyBeforeStop;
+    }
+
+    const result = await workers.startRalphLoop(feature, options);
+
+    if (!result.success) {
+      return { content: [{ type: "text", text: `Failed to start Ralph Loop: ${result.error}` }] };
+    }
+
+    feature.status = "in_progress";
+    feature.workerId = result.sessionName;
+    feature.startedAt = new Date().toISOString();
+    feature.attempts++;
+
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 🔄 Ralph Loop started: ${featureId} (session: ${result.sessionName}, max iterations: ${options.maxIterations || 50})`
+    );
+    state.save(current);
+
+    return {
+      content: [{
+        type: "text",
+        text: `🔄 Ralph Loop started!\n  Feature: ${featureId}\n  Session: ${result.sessionName}\n  Max iterations: ${options.maxIterations || 50}\n  Max duration: ${options.maxDurationMinutes || 480} minutes\n\nWorker will iterate with fresh context until feature is complete.\nProgress tracked in: .claude/orchestrator/workers/${featureId}.progress.md`,
+      }],
+    };
+  }
+);
+
+// ============================================================================
+// TOOL: shutdown_session
+// ============================================================================
+server.tool(
+  "shutdown_session",
+  "Gracefully shut down the orchestration session. Creates a checkpoint, stops all workers (letting current iteration finish), and writes shutdown record. Use before closing laptop for resume_session recovery later.",
+  {
+    projectDir: z.string().describe("Absolute path to the project directory"),
+    checkpoint: z.boolean().optional().describe("Create a checkpoint before shutdown (default: true)"),
+    waitSeconds: z.number().min(0).max(120).optional().describe("Seconds to wait for workers to finish current iteration (default: 60)"),
+  },
+  async ({ projectDir, checkpoint = true, waitSeconds = 60 }) => {
+    const { state, workers } = await ensureInitialized(projectDir);
+    const current = state.load();
+
+    if (!current) {
+      return { content: [{ type: "text", text: "No active session." }] };
+    }
+
+    // Get active worker info for checkpoint
+    const workerStatuses = await workers.checkAllWorkers();
+    const activeWorkers = workerStatuses
+      .filter(w => w.status === "running")
+      .map(w => ({
+        featureId: w.featureId,
+        sessionName: w.sessionName,
+        tmuxAlive: true,
+        lastProgress: "",
+        iteration: 0,
+        phase: "implementing" as const,
+      }));
+
+    // Create checkpoint if requested
+    let checkpointId: string | undefined;
+    if (checkpoint) {
+      try {
+        checkpointId = await state.checkpoint("shutdown", activeWorkers);
+      } catch (error) {
+        console.error("Failed to create shutdown checkpoint:", error);
+      }
+    }
+
+    // Wait for workers to finish current iteration
+    if (activeWorkers.length > 0 && waitSeconds > 0) {
+      // Brief wait to let in-flight work complete
+      await new Promise(resolve => setTimeout(resolve, Math.min(waitSeconds, 10) * 1000));
+    }
+
+    // Kill all workers
+    await workers.killAllWorkers();
+
+    // Update feature statuses
+    for (const feature of current.features) {
+      if (feature.status === "in_progress") {
+        feature.status = "pending";
+        feature.workerId = undefined;
+      }
+    }
+
+    current.status = "paused";
+    current.progressLog.push(
+      `[${new Date().toISOString()}] 🛑 Session shut down gracefully${checkpointId ? ` (checkpoint: ${checkpointId})` : ""}. ${activeWorkers.length} worker(s) stopped.`
+    );
+    state.save(current);
+    state.writeProgressFile();
+
+    // Remove heartbeat
+    state.removeHeartbeat();
+
+    return {
+      content: [{
+        type: "text",
+        text: `🛑 Session shut down gracefully!\n\n  Workers stopped: ${activeWorkers.length}\n  Checkpoint: ${checkpointId || "none"}\n  Status: paused\n\nTo resume later: use resume_session with crash recovery.\nAll progress has been saved to filesystem.`,
+      }],
     };
   }
 );

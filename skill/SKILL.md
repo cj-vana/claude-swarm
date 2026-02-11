@@ -55,6 +55,22 @@ Before starting any feature work, ensure the repository is ready:
 
 **Why:** Ensures repos have CLAUDE.md, CI, and other essentials before feature work begins.
 
+### Phase 0.5: Session Recovery Check
+
+Before starting a new session, check if a previous session crashed:
+
+```
+1. CHECK for crashed session:
+   → resume_session(projectDir)
+   - If crash detected: auto-recovers from checkpoint
+   - If paused: resumes with pending features listed
+   - If no session: proceed to Phase 1
+
+2. IF recovered:
+   → orchestrator_status(projectDir)
+   → Decide: continue existing session or orchestrator_reset to start fresh
+```
+
 ### Phase 1: Session Setup
 
 ```
@@ -72,14 +88,26 @@ Before starting any feature work, ensure the repository is ready:
    - Features with score >= 60 are flagged for competitive planning
    - Use these results to inform Phase 3 execution strategy
 
-4. OPTIONAL - Set up behavioral constraints:
+4. PLAN MODE DECISION:
+   Ask user: "Enable worker plan mode? Workers will analyze the codebase
+   and produce a plan before implementing. Orchestrator auto-approves plans."
+   - If yes: → configure_plan_mode(projectDir, { enabled: true, complexityThreshold: 30 })
+   - If no: skip (workers implement directly, current behavior)
+
+5. EXECUTION MODE DECISION:
+   Ask user: "Enable Ralph Loop for long-running autonomy? Workers get fresh
+   context each iteration and persist progress to files. Best for hours/days-long sessions."
+   - If yes: → configure_ralph_loop(projectDir, { enabled: true })
+   - If no: Workers use standard single-run execution
+
+6. OPTIONAL - Set up behavioral constraints:
    → protocol_register(protocol JSON)
    → protocol_activate(protocolId)
 
-5. OPTIONAL - Configure pre-completion verification:
+7. OPTIONAL - Configure pre-completion verification:
    → configure_verification(commands: ["npm test", "tsc --noEmit"])
 
-6. OPTIONAL - Set feature dependencies:
+8. OPTIONAL - Set feature dependencies:
    → set_dependencies(featureId, dependsOn: ["feature-1", "feature-2"])
 ```
 
@@ -128,6 +156,9 @@ FOR INDEPENDENT FEATURES (can run simultaneously):
 FOR DEPENDENT/SEQUENTIAL FEATURES:
    → start_worker(featureId)
 
+FOR LONG-RUNNING FEATURES (Ralph Loop enabled):
+   → start_ralph_loop(featureId)  # Fresh context per iteration
+
 ---
 
 OPTION B: Hands-Free Orchestration
@@ -139,6 +170,16 @@ Strategies:
 - breadth-first: Parallelize independent features first
 - depth-first: Focus on unblocking dependent features
 - adaptive: Let the system decide based on dependencies
+
+When plan mode is enabled, auto_orchestrate automatically:
+- Runs plan phase for features with complexity >= threshold
+- Auto-approves plans that score >= 50
+- Re-plans up to 2x if rejected, then falls back to direct implementation
+
+When Ralph Loop is enabled, auto_orchestrate automatically:
+- Uses fresh-context iteration for each worker
+- Tracks progress via filesystem (no context rot)
+- Creates periodic checkpoints for crash recovery
 
 Note: auto_orchestrate handles Phases 3-5 automatically, returning when all features complete.
 ```
@@ -212,6 +253,14 @@ LOST CONTEXT (after compaction)?
 NEED TO PAUSE?
    → pause_session()   # Stops all workers
    → resume_session()  # Continue later
+
+NEED TO SHUT DOWN (laptop closing, end of day)?
+   → shutdown_session(projectDir)  # Checkpoints + graceful stop
+   → resume_session(projectDir)    # Recover next time (auto-detects crash)
+
+SESSION CRASHED (machine sleep, tmux died)?
+   → resume_session(projectDir)  # Auto-detects crash, recovers from checkpoint
+   → resume_session(projectDir, fromCheckpoint: "latest")  # Explicit checkpoint recovery
 
 NEED TO ABORT?
    → orchestrator_reset(confirm: true)  # Nuclear option
@@ -784,10 +833,13 @@ A real-time web dashboard is available at `http://localhost:3456`:
 |------|---------|
 | `start_worker` | Launch worker for a feature |
 | `start_parallel_workers` | Launch multiple workers |
+| `start_ralph_loop` | Launch worker with Ralph Loop (fresh context per iteration) |
+| `start_continuous_worker` | Launch worker that processes multiple features sequentially |
 | `validate_workers` | Pre-flight validation |
 | `check_worker` | Monitor worker output (heartbeat + cursor modes) |
 | `check_all_workers` | Check all active workers at once |
 | `send_worker_message` | Send instructions to running worker |
+| `enqueue_feature` | Add feature to continuous worker's queue |
 
 ### Competitive Planning
 | Tool | Purpose |
@@ -810,6 +862,8 @@ A real-time web dashboard is available at `http://localhost:3456`:
 | `run_verification` | Run tests/build |
 | `add_feature` | Add discovered work |
 | `set_dependencies` | Define dependencies |
+| `configure_plan_mode` | Enable/configure worker plan mode |
+| `configure_ralph_loop` | Enable/configure Ralph Loop execution |
 
 ### Session & Progress
 | Tool | Purpose |
@@ -817,7 +871,8 @@ A real-time web dashboard is available at `http://localhost:3456`:
 | `get_progress_log` | Full history (paginated) |
 | `get_session_stats` | Success rates and timing |
 | `pause_session` | Pause, stop all workers |
-| `resume_session` | Resume paused session |
+| `resume_session` | Resume paused session (supports crash recovery) |
+| `shutdown_session` | Graceful shutdown with checkpoint |
 | `commit_progress` | Git checkpoint |
 
 ### Post-Completion Reviews
